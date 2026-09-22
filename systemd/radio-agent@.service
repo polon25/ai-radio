@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Radio - DJ agent loop (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polonius
+WorkingDirectory=/home/polonius/Programy/Radio
+EnvironmentFile=/home/polonius/Programy/Radio/.env
+Environment=STATION_ID=%i
+ExecStart=/home/polonius/Programy/Radio/venv/bin/python -u /home/polonius/Programy/Radio/dj_agent.py %i --loop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

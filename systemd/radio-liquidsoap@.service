@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Radio - Liquidsoap player (%i)
+After=network.target icecast2.service
+Wants=icecast2.service
+
+[Service]
+Type=simple
+User=polonius
+WorkingDirectory=/home/polonius/Programy/Radio
+EnvironmentFile=/home/polonius/Programy/Radio/.env
+Environment=STATION_ID=%i
+ExecStart=/usr/bin/liquidsoap /home/polonius/Programy/Radio/radio.liq
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

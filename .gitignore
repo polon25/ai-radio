@@ -1,0 +1,9 @@
+.env
+stations.json
+venv/
+__pycache__/
+*.db
+*.mp3
+dj_playlist_*.txt
+artists_*.json
+dj_agent_*.log

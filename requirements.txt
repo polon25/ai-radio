@@ -1,0 +1,5 @@
+requests>=2.32
+edge-tts>=7.2
+python-dotenv>=1.0
+mutagen>=1.47
+imageio-ffmpeg>=0.5
