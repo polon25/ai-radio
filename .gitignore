@@ -7,3 +7,4 @@ __pycache__/
 dj_playlist_*.txt
 artists_*.json
 dj_agent_*.log
+scanner.lock

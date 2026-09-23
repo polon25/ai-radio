@@ -55,6 +55,14 @@ niche collection (a specific fandom's music, a soundtrack folder, ...): AI
 classification adds no value there, and risks wrongly banning legitimate
 artists it just doesn't recognize.
 
+### Library scanning
+
+`--loop` runs `scanner.py` in the background once at startup, then again
+every `SCAN_INTERVAL_HOURS` (default 2). If several stations' `--loop`
+processes are running against the same `music_library.db`, a `scanner.lock`
+file makes sure only one of them actually scans at a time — the rest just
+skip that round.
+
 ## Setup
 
 1. **Python environment**
@@ -77,6 +85,7 @@ artists it just doesn't recognize.
    | `OPENROUTER_SITE_URL` | Optional; sent as `HTTP-Referer` to OpenRouter |
    | `OPENROUTER_TIMEOUT` | Optional; seconds before an OpenRouter request is given up on (default 60) |
    | `BLOCK_LEAD_TIME` | Optional; seconds before a block's natural end that the next one starts generating (default 15) |
+   | `SCAN_INTERVAL_HOURS` | Optional; how often `--loop` rescans the music library in the background, in addition to always scanning once at startup. `0` disables the periodic rescan (default 2) |
 
 3. **Stations** — copy `stations.json.example` to `stations.json` and edit it
    (see [Configuring a station](#configuring-a-station) below).
@@ -90,9 +99,10 @@ artists it just doesn't recognize.
    ./venv/bin/python scanner.py
    ```
 
-   Re-run this whenever the library changes — `dj_agent.py` picks up newly
-   scanned artists on its own on the next run (see [Artist
-   roster](#artist-roster)).
+   `dj_agent.py --loop` re-scans automatically (see [Library
+   scanning](#library-scanning)), so this manual run is mainly for seeding
+   the database before the first `--loop` start, or for `dj_agent.py`'s
+   one-shot mode.
 
 ## Configuring a station
 

@@ -28,8 +28,13 @@ OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "60"))
 # "the last track just started" on this deployment's version, so dj_agent.py
 # schedules itself using each block's own known duration instead).
 BLOCK_LEAD_TIME = int(os.getenv("BLOCK_LEAD_TIME", "15"))
+# In --loop mode, how often to re-scan the music library in the background
+# (in addition to always scanning once at startup). 0 disables the periodic
+# rescan (a scan still runs at startup).
+SCAN_INTERVAL_HOURS = float(os.getenv("SCAN_INTERVAL_HOURS", "2"))
 DB_FILE = "music_library.db"
 CONFIG_FILE = "stations.json"
+SCAN_LOCK_FILE = "scanner.lock"
 DEFAULT_SONGS_PER_BLOCK = 3
 
 
@@ -355,6 +360,40 @@ async def run_station(station_id):
     return update_playlist(selected_tracks, dj_audio_file, playlist_file)
 
 
+def run_scanner_once():
+    """Runs scanner.py to (re)index the music library. Several stations may
+    each run their own --loop process against the same music_library.db, so
+    a lock file makes sure only one scan runs at a time — the others just
+    skip that round rather than racing each other."""
+    if os.path.exists(SCAN_LOCK_FILE):
+        age = time.time() - os.path.getmtime(SCAN_LOCK_FILE)
+        if age < 3600:
+            print("A library scan is already in progress (elsewhere); skipping this round.")
+            return
+        print("Found a stale scan lock; a previous scan may have crashed. Proceeding anyway.")
+
+    with open(SCAN_LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        print("Scanning music library in the background...")
+        subprocess.run([sys.executable, "scanner.py"], check=False)
+    finally:
+        try:
+            os.remove(SCAN_LOCK_FILE)
+        except FileNotFoundError:
+            pass
+
+
+async def scanner_loop():
+    """Scans once immediately, then every SCAN_INTERVAL_HOURS (if > 0)."""
+    loop = asyncio.get_event_loop()
+    while True:
+        await loop.run_in_executor(None, run_scanner_once)
+        if SCAN_INTERVAL_HOURS <= 0:
+            return
+        await asyncio.sleep(SCAN_INTERVAL_HOURS * 3600)
+
+
 async def main():
     args = [a for a in sys.argv[1:] if a != "--loop"]
     loop_mode = "--loop" in sys.argv[1:]
@@ -368,6 +407,10 @@ async def main():
     if not loop_mode:
         await run_station(station_id)
         return
+
+    # Scan the library in the background: once now, then periodically. Runs
+    # independently of block generation below, so it never delays playback.
+    asyncio.create_task(scanner_loop())
 
     # If a playlist file from a previous run is already sitting there (e.g.
     # this process crashed and got restarted by a supervisor), don't
