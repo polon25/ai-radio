@@ -111,7 +111,7 @@ keyed by station ID:
 
 ```json
 {
-  "metal_pl": {
+  "ciezki_mlot": {
     "name": "Ciężki Młot",
     "description": "Polskie radio z muzyką metalową",
     "voice": "pl-PL-MarekNeural",
@@ -136,19 +136,19 @@ keyed by station ID:
   `folder_filter`. Optional, defaults to `true`.
 - `roster_prompt` and `prompt` must each produce raw JSON with a
   `selected_indices` field (`prompt` additionally needs `dj_script`); see the
-  `metal_pl` entry for the exact contract each is held to. `prompt` can use
+  `ciezki_mlot` entry for the exact contract each is held to. `prompt` can use
   `{song_count}` to reference `songs_per_block` instead of hardcoding a
   number.
 - `voice` is any [Edge TTS voice name](https://github.com/rany2/edge-tts#usage).
 
 ## Running
 
-Each station needs both processes running, e.g. for `metal_pl`:
+Each station needs both processes running, e.g. for `ciezki_mlot`:
 
 ```bash
-export $(grep -v '^#' .env | xargs)   # or set STATION_ID=metal_pl directly
+export $(grep -v '^#' .env | xargs)   # or set STATION_ID=ciezki_mlot directly
 liquidsoap radio.liq &
-./venv/bin/python dj_agent.py metal_pl --loop &
+./venv/bin/python dj_agent.py ciezki_mlot --loop &
 ```
 
 ### Running at boot (systemd)
@@ -163,16 +163,16 @@ sudo systemctl daemon-reload
 Then enable a station by its ID (the `@<id>` becomes `$STATION_ID`):
 
 ```bash
-sudo systemctl enable --now radio-liquidsoap@metal_pl.service
-sudo systemctl enable --now radio-agent@metal_pl.service
+sudo systemctl enable --now radio-liquidsoap@ciezki_mlot.service
+sudo systemctl enable --now radio-agent@ciezki_mlot.service
 ```
 
 Adding another station later is just another `enable --now` pair with a
-different ID — no new unit files needed. Logs: `journalctl -u radio-agent@metal_pl -f`.
+different ID — no new unit files needed. Logs: `journalctl -u radio-agent@ciezki_mlot -f`.
 
 ## Adding a new station
 
-1. Add an entry to `stations.json` (copy `metal_pl`'s shape).
+1. Add an entry to `stations.json` (copy `ciezki_mlot`'s shape).
 2. Pick a `folder_filter` that scopes it to the right part of your library.
 3. Run it once manually to build its artist roster and confirm the prompts
    produce sensible output, then enable the two systemd services for it.
