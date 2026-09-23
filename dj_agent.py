@@ -739,14 +739,20 @@ def finish_speech_audio(path):
 async def generate_audio(text, output_file, voice):
     """Converts the generated text to speech using Edge TTS (an online
     service), retrying a few times. Returns whether it succeeded, so a
-    network hiccup costs the block its intro rather than the whole block."""
+    network hiccup costs the block its intro rather than the whole block.
+
+    The audio is made in a temporary file and only moved into place once
+    finished, so Liquidsoap never opens a half-made file (Edge TTS writes
+    mono, which it refuses to play)."""
     log.info(f"Generating intro with voice '{voice}': {text}")
     attempts = len(TTS_RETRY_DELAYS) + 1
+    tmp_file = f"{output_file}.tts.tmp.mp3"
     for attempt in range(1, attempts + 1):
         try:
             communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(output_file)
-            finish_speech_audio(output_file)
+            await communicate.save(tmp_file)
+            finish_speech_audio(tmp_file)
+            os.replace(tmp_file, output_file)
             return True
         except Exception as e:
             log.warning(f"Intro speech synthesis failed (attempt {attempt}/{attempts}): {e!r}")
@@ -1123,6 +1129,12 @@ def get_news_stories(settings, language, hour):
     return stories
 
 
+def news_queued_marker(station_id, hour):
+    """Marks that the news for `hour` is queued on the station, so an agent
+    restarted around the top of the hour doesn't queue it a second time."""
+    return os.path.join(get_station_dir(station_id), NEWS_DIR_NAME, f"{hour:%Y%m%d-%H}.queued")
+
+
 async def prepare_news_segment(station_id, config, settings, hour):
     """Writes and synthesizes the news segment for `hour` (a datetime on the
     hour). Returns the audio file's path, or None if it couldn't be made."""
@@ -1138,8 +1150,9 @@ async def prepare_news_segment(station_id, config, settings, hour):
     log.info(f"News for {hour:%H:%M} ({len(script.split())} words): {script}")
     news_dir = os.path.join(get_station_dir(station_id), NEWS_DIR_NAME)
     os.makedirs(news_dir, exist_ok=True)
-    for name in sorted(f for f in os.listdir(news_dir) if f.endswith(".mp3"))[:-3]:
-        os.remove(os.path.join(news_dir, name))
+    for suffix in (".mp3", ".queued"):
+        for name in sorted(f for f in os.listdir(news_dir) if f.endswith(suffix))[:-3]:
+            os.remove(os.path.join(news_dir, name))
     path = os.path.abspath(os.path.join(news_dir, f"{hour:%Y%m%d-%H}.mp3"))
     if not await generate_audio(script, path, config['voice']):
         return None
@@ -1174,6 +1187,9 @@ async def news_loop(station_id):
         try:
             config = load_station_config(station_id)
             settings = news.news_settings(config)
+            if settings and os.path.exists(news_queued_marker(station_id, next_hour)):
+                log.info(f"The {next_hour:%H:%M} news is already queued.")
+                settings = None
             path = settings and await prepare_news_segment(station_id, config, settings, next_hour)
             queue_at = next_hour - datetime.timedelta(minutes=NEWS_QUEUE_MINUTES)
             await asyncio.sleep(max(0.0, (queue_at - datetime.datetime.now()).total_seconds()))
@@ -1182,6 +1198,7 @@ async def news_loop(station_id):
                 log.warning(f"The {next_hour:%H:%M} news was ready {late:.0f} min late; skipping it.")
             elif path:
                 await loop_run(queue_news, player, path, config, settings)
+                open(news_queued_marker(station_id, next_hour), "w").close()
         except OSError as e:
             log.error(f"Couldn't put the news on air, Liquidsoap unreachable: {e}")
         except Exception:
