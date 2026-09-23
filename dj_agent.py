@@ -73,6 +73,16 @@ DEFAULT_ARTIST_COOLDOWN_FRACTION = 0.1
 # Shorter tracks (intros, interludes, skits...) aren't played, unless a
 # station sets its own min_track_seconds.
 DEFAULT_MIN_TRACK_SECONDS = 90
+# A track that played on a station within the last track_cooldown_hours
+# (default below) isn't picked there again while the artist has other
+# tracks, and an artist whose tracks all played that recently isn't picked
+# at all. So that small stations don't end up cycling through their whole
+# library in the same order, the cooldown never exceeds this share of the
+# station's total music: about half its tracks are always eligible.
+DEFAULT_TRACK_COOLDOWN_HOURS = 24
+TRACK_COOLDOWN_LIBRARY_SHARE = 0.5
+# Play history older than this is deleted.
+PLAY_HISTORY_DAYS = 30
 # Artists are classified into a station's roster this many per AI request:
 # with hundreds in one numbered list, models lose track of the numbers and
 # pick huge swathes of off-theme artists.
@@ -293,6 +303,69 @@ def get_track_by_artist(artist, config):
     track = c.fetchone()
     conn.close()
     return track
+
+def get_station_tracks(config):
+    """Every track the station may play, as (filepath, artist, title,
+    duration) tuples."""
+    clause, params = track_filter_clause(config)
+    conn = sqlite3.connect(DB_FILE)
+    rows = conn.execute(
+        f"SELECT filepath, artist, title, duration FROM tracks WHERE {clause}", params
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def init_play_history():
+    """Creates the play history table if needed and drops entries older
+    than PLAY_HISTORY_DAYS."""
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.execute("""CREATE TABLE IF NOT EXISTS plays
+                    (station TEXT NOT NULL, filepath TEXT NOT NULL, played_at REAL NOT NULL)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS plays_by_track ON plays (station, filepath, played_at)")
+    conn.execute("DELETE FROM plays WHERE played_at < ?", (time.time() - PLAY_HISTORY_DAYS * 86400,))
+    conn.commit()
+    conn.close()
+
+
+def record_play(station_id, metadata, played_at):
+    """Records that a track started playing on the station (called for every
+    "now playing" Liquidsoap reports; DJ intros aren't recorded)."""
+    path = metadata.get("filename", "")
+    if not path or os.path.basename(os.path.dirname(path)) == INTROS_DIR_NAME:
+        return
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.execute("INSERT INTO plays (station, filepath, played_at) VALUES (?, ?, ?)", (station_id, path, played_at))
+    conn.commit()
+    conn.close()
+
+
+def get_last_plays(station_id):
+    """When each track last played on the station: {filepath: timestamp}."""
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    rows = conn.execute(
+        "SELECT filepath, MAX(played_at) FROM plays WHERE station = ? GROUP BY filepath", (station_id,)
+    ).fetchall()
+    conn.close()
+    return dict(rows)
+
+
+def track_cooldown_seconds(config, tracks):
+    """The station's track cooldown: track_cooldown_hours, capped at
+    TRACK_COOLDOWN_LIBRARY_SHARE of the total length of `tracks`."""
+    hours = config.get('track_cooldown_hours', DEFAULT_TRACK_COOLDOWN_HOURS)
+    library_seconds = sum(duration or 0 for _, _, _, duration in tracks)
+    return min(hours * 3600, library_seconds * TRACK_COOLDOWN_LIBRARY_SHARE)
+
+
+def pick_track(artist_tracks, last_plays, cutoff):
+    """One of an artist's tracks: a random one among those that haven't
+    played since `cutoff`, or else the one that played longest ago."""
+    fresh = [t for t in artist_tracks if last_plays.get(t[0], 0) < cutoff]
+    if fresh:
+        return random.choice(fresh)
+    return min(artist_tracks, key=lambda t: last_plays.get(t[0], 0))
+
 
 def format_artist_list(artists):
     """Numbers an artist list for injection into a prompt (1-indexed, to
@@ -697,13 +770,34 @@ async def run_station(station_id):
         return
     cooldown = artist_cooldown(len(playable), cooldown_fraction)
     history = load_recent_artists(station_id)
-    eligible_artists = filter_by_cooldown(playable, history, cooldown)
+
+    # Leave out artists all of whose tracks played too recently (see
+    # DEFAULT_TRACK_COOLDOWN_HOURS), e.g. one with a single track that
+    # already played today. If that leaves too few, the track cooldown is
+    # ignored, then the artist cooldown too.
+    playable_set = set(playable)
+    tracks_by_artist = {}
+    for track in get_station_tracks(config):
+        if track[1] in playable_set:
+            tracks_by_artist.setdefault(track[1], []).append(track)
+    track_cooldown = track_cooldown_seconds(config, [t for ts in tracks_by_artist.values() for t in ts])
+    cutoff = time.time() - track_cooldown
+    last_plays = get_last_plays(station_id)
+    fresh_artists = [
+        a for a in playable
+        if any(last_plays.get(t[0], 0) < cutoff for t in tracks_by_artist.get(a, []))
+    ]
+    eligible_artists = filter_by_cooldown(fresh_artists, history, cooldown)
+    if len(eligible_artists) < song_count:
+        log.info("Too few artists with tracks outside the track cooldown; ignoring it this time.")
+        eligible_artists = filter_by_cooldown(playable, history, cooldown)
     if len(eligible_artists) < song_count:
         eligible_artists = playable
     artists_pool = random.sample(eligible_artists, min(len(eligible_artists), 25))
     log.info(
-        f"Offering {len(artists_pool)} artist(s) to the AI "
-        f"({len(eligible_artists)} eligible, cooldown {cooldown} song(s))"
+        f"Offering {len(artists_pool)} artist(s) to the AI ({len(eligible_artists)} eligible; "
+        f"artist cooldown {cooldown} song(s), track cooldown {track_cooldown / 3600:.1f}h "
+        f"leaves {len(fresh_artists)} of {len(playable)} artists)"
     )
 
     # 3. Ask AI to pick best artists and write intro using prompt from config
@@ -719,14 +813,18 @@ async def run_station(station_id):
 
     save_recent_artists(station_id, history + selected_artists)
 
-    # 4. Fetch one random track for each selected artist
+    # 4. Pick a track for each selected artist, avoiding recently played ones
     selected_tracks = []
     for artist in selected_artists:
-        track = get_track_by_artist(artist, config)
-        if track:
-            selected_tracks.append(track)
-        else:
+        artist_tracks = tracks_by_artist.get(artist)
+        if not artist_tracks:
             log.warning(f"No track found in the library for artist '{artist}'")
+            continue
+        path, _, title, _ = track = pick_track(artist_tracks, last_plays, cutoff)
+        if last_plays.get(path, 0) >= cutoff:
+            ago = (time.time() - last_plays[path]) / 3600
+            log.info(f"Every track by '{artist}' played recently; repeating the oldest, '{title}' ({ago:.1f}h ago)")
+        selected_tracks.append(track[:3])
 
     if not selected_tracks:
         log.error("Could not retrieve tracks for selected artists.")
@@ -858,9 +956,12 @@ async def main():
     log.info("DJ agent started", extra=SUMMARY)
 
     # Forward Liquidsoap's log (radio.liq writes it to a spool file in the
-    # station's log folder) into this station's logs.
+    # station's log folder) into this station's logs, and record every track
+    # it starts playing for the track cooldown.
+    init_play_history()
     LiquidsoapLogForwarder(
-        os.path.join(get_log_dir(station_id), LIQUIDSOAP_SPOOL_FILE), describe_track
+        os.path.join(get_log_dir(station_id), LIQUIDSOAP_SPOOL_FILE), describe_track,
+        on_track_start=lambda metadata, played_at: record_play(station_id, metadata, played_at),
     ).start()
 
     # Scan the library in the background: once now, then periodically. Runs

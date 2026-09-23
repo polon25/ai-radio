@@ -178,12 +178,14 @@ class LiquidsoapLogForwarder(threading.Thread):
 
     radio.liq logs every track that starts playing under the "now_playing"
     label, with its metadata as JSON; those become readable "Now playing"
-    lines (or a dead-air warning if nothing is available to play)."""
+    lines (or a dead-air warning if nothing is available to play), and are
+    passed to on_track_start(metadata, timestamp) if given."""
 
-    def __init__(self, spool_path, describe_track, interval=2.0):
+    def __init__(self, spool_path, describe_track, on_track_start=None, interval=2.0):
         super().__init__(name="liquidsoap-log", daemon=True)
         self.spool_path = spool_path
         self.describe_track = describe_track
+        self.on_track_start = on_track_start
         self.interval = interval
         self.offset = 0
         self.log = logging.getLogger("liquidsoap")
@@ -263,6 +265,11 @@ class LiquidsoapLogForwarder(threading.Thread):
                     created,
                 )
             self.silent_since = None
+        if self.on_track_start:
+            try:
+                self.on_track_start(metadata, created)
+            except Exception:
+                self.log.exception("Failed to record a track start")
         if metadata.get("source") == FALLBACK_SOURCE_ID:
             self._emit(
                 logging.WARNING,

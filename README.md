@@ -106,6 +106,27 @@ fewer eligible artists than a block needs, it's ignored for that round
 rather than stalling generation. Set `artist_cooldown_fraction` to `0` to
 disable it entirely.
 
+### Track cooldown
+
+Every track a station starts playing is recorded in a `plays` table in
+`music_library.db` (fallback tracks included, DJ intros not; entries older
+than 30 days are dropped). When a block is prepared:
+
+- artists all of whose tracks played on this station within the track
+  cooldown aren't offered to the AI (so an artist with a single track in
+  the library plays it at most once per cooldown),
+- and each picked artist gets a random track among those that didn't play
+  within the cooldown — or, if there are none, the one that played longest
+  ago.
+
+The cooldown is `track_cooldown_hours` (default 24), but never more than
+half the total length of the station's music: a small station (say, a few
+hours of music) would otherwise run out of eligible tracks and end up
+cycling through its library in the same order every time. With the cap,
+roughly half its tracks are always eligible and picks stay random. If the
+cooldown still leaves fewer artists than a block needs, it's ignored for
+that block.
+
 ### Station files
 
 Everything a station generates at runtime lives in its own folder,
@@ -219,6 +240,7 @@ keyed by station ID:
     "use_ai_roster": true,
     "artist_cooldown_fraction": 0.1,
     "min_track_seconds": 90,
+    "track_cooldown_hours": 24,
     "fallback_script": "...",
     "roster_prompt": "... {station_name} ... {description} ... {artists_list} ...",
     "prompt": "... {station_name} ... {description} ... {artists_list} ... {song_count} ..."
@@ -240,6 +262,8 @@ keyed by station ID:
 - `min_track_seconds` — tracks shorter than this (intros, interludes,
   skits, ...) are never played, and artists with only such tracks aren't
   picked. Optional, defaults to `90`.
+- `track_cooldown_hours` — see [Track cooldown](#track-cooldown). Optional,
+  defaults to `24`.
 - `roster_prompt` and `prompt` must each produce raw JSON with a
   `selected_indices` field (`prompt` additionally needs `dj_script`); see the
   `ciezki_mlot` entry for the exact contract each is held to. `prompt` can use
