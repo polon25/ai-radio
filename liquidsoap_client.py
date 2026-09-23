@@ -32,9 +32,17 @@ class Liquidsoap:
         lines = b"".join(chunks).decode("utf-8", "replace").replace("\r", "").split("\n")
         return [line for line in lines if line and line not in ("END", "Bye!")]
 
-    def push(self, path):
-        """Appends a file to the block queue; returns its request ID."""
-        return int(self.command(f"{QUEUE_ID}.push {path}")[0])
+    def push(self, path, metadata=None):
+        """Appends a file to the block queue, optionally with metadata that
+        overrides its tags (e.g. {"title": "..."}); returns its request ID."""
+        uri = path
+        if metadata:
+            fields = ",".join(
+                f'{key}="{str(value).replace(chr(92), "").replace(chr(34), chr(39))}"'
+                for key, value in metadata.items()
+            )
+            uri = f"annotate:{fields}:{path}"
+        return int(self.command(f"{QUEUE_ID}.push {uri}")[0])
 
     def queue(self):
         """Request IDs in the block queue, including the one playing now."""

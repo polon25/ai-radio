@@ -2,6 +2,8 @@
   "example_station": {
     "name": "Example FM",
     "description": "A short description of the station's theme/vibe — steers both artist selection and the DJ script",
+    "genre": "Rock",
+    "url": "https://example.com",
     "voice": "en-US-GuyNeural",
     "folder_filter": "%/some-genre-folder/%",
     "songs_per_block": 3,
@@ -16,6 +18,7 @@
   "another_example_dedicated_folder": {
     "name": "Dedicated Folder FM",
     "description": "A station scoped to a folder that's already curated, so it skips AI artist filtering entirely",
+    "genre": "Various",
     "voice": "en-US-GuyNeural",
     "folder_filter": ["%/Some Folder/%", "%/Another Folder/%"],
     "songs_per_block": 3,

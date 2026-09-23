@@ -738,10 +738,13 @@ class QueueState:
         self.seconds_left = seconds
 
 
-def queue_block(player, files):
-    """Pushes a block's files onto Liquidsoap's queue, in play order."""
+def queue_block(player, files, station_name):
+    """Pushes a block's files onto Liquidsoap's queue, in play order. The
+    DJ intro has no tags of its own, so it's given the station's name as
+    artist and "DJ" as title for the stream's "now playing"."""
     for path in files:
-        player.push(path)
+        is_intro = os.path.basename(os.path.dirname(path)) == INTROS_DIR_NAME
+        player.push(path, {"artist": station_name, "title": "DJ"} if is_intro else None)
 
 
 async def run_station(station_id):
@@ -1011,7 +1014,8 @@ async def feed_player(station_id):
             await asyncio.sleep(BLOCK_RETRY_DELAY)
             continue
         try:
-            await loop.run_in_executor(None, queue_block, player, files)
+            station_name = load_station_config(station_id)['name']
+            await loop.run_in_executor(None, queue_block, player, files, station_name)
             log.info(f"Queued the block ({len(files)} files).")
         except OSError as e:
             log.error(f"Couldn't queue the block, Liquidsoap unreachable ({e}); it will be regenerated.")
@@ -1050,7 +1054,7 @@ async def main():
         files = await run_station(station_id)
         if files:
             try:
-                queue_block(Liquidsoap(get_socket_file(station_id)), files)
+                queue_block(Liquidsoap(get_socket_file(station_id)), files, load_station_config(station_id)['name'])
                 log.info("Queued the block.")
             except OSError as e:
                 log.warning(f"Block generated but not queued, Liquidsoap unreachable: {e}")

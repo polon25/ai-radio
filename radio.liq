@@ -30,6 +30,18 @@ icecast_port = int_of_string(if requested_port != "" then requested_port else "8
 requested_mount = getenv("ICECAST_MOUNT")
 icecast_mount = if requested_mount != "" then requested_mount else "/#{station_id}" end
 
+# Stream details shown by Icecast and players (name, description, genre,
+# url), from the station's entry in stations.json via stream_info.py, since
+# this Liquidsoap version can't parse stations.json itself.
+stream_info = of_json(
+  default=[("name", "")],
+  get_process_output("python3 #{project_dir}stream_info.py #{string.quote(station_id)}")
+)
+def stream_field(key, fallback) =
+  value = list.assoc(default="", key, stream_info)
+  if value != "" then value else fallback end
+end
+
 if station_id == "" then
   print("ERROR: STATION_ID env var is not set (see .env.example).")
 end
@@ -96,5 +108,9 @@ output.icecast(
   port = icecast_port,
   password = icecast_password,
   mount = icecast_mount,
+  name = stream_field("name", station_id),
+  description = stream_field("description", ""),
+  genre = stream_field("genre", ""),
+  url = stream_field("url", ""),
   safe_radio
 )

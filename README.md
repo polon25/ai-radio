@@ -248,6 +248,7 @@ keyed by station ID:
   "ciezki_mlot": {
     "name": "Ciężki Młot",
     "description": "Polskie radio z muzyką metalową",
+    "genre": "Metal",
     "voice": "pl-PL-MarekNeural",
     "folder_filter": "%/Inna muzyka/%",
     "songs_per_block": 3,
@@ -290,6 +291,12 @@ keyed by station ID:
   `{song_count}` to reference `songs_per_block` instead of hardcoding a
   number.
 - `voice` is any [Edge TTS voice name](https://github.com/rany2/edge-tts#usage).
+- `name`, `description`, `genre` and `url` (the last two optional) are also
+  the stream's details on its Icecast mount, shown in Icecast's status page
+  and in players. `radio.liq` reads them at startup through
+  `stream_info.py`, so restart the station's Liquidsoap after changing them.
+  While a DJ intro plays, the stream's "now playing" reads
+  `<name> - DJ`.
 
 ## Running
 
