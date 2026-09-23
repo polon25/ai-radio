@@ -153,6 +153,8 @@ skip that round.
    | `ICECAST_MOUNT` | Optional; defaults to `/<STATION_ID>` |
    | `OPENROUTER_SITE_URL` | Optional; sent as `HTTP-Referer` to OpenRouter |
    | `OPENROUTER_TIMEOUT` | Optional; seconds before an OpenRouter request is given up on (default 60) |
+   | `OPENROUTER_MODEL` | Optional; OpenRouter model to use (default `openrouter/free`, which picks some free model per request) |
+   | `OPENROUTER_ATTEMPTS` | Optional; how many times a request whose answer is unusable (not JSON, missing fields, no valid artists) is tried before falling back to a random pick and the station's `fallback_script` (default 3) |
    | `BLOCK_LEAD_TIME` | Optional; the next block is prepared once the last queued track starts, or as soon as less than this many seconds of music are left in the queue (default 120) |
    | `LOG_RETENTION_DAYS` | Optional; days of daily [log files](#logs) to keep (default 7) |
    | `LOG_LEVEL` | Optional; minimum level written to the station logs and stdout (default `INFO`) |

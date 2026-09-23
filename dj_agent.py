@@ -33,6 +33,11 @@ llm_log = logging.getLogger("llm")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://github.com/your-username/your-project")
 OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "60"))
+# "openrouter/free" routes each request to some free model, which now and
+# then is one that can't follow the prompt (e.g. a content-safety classifier
+# answering "User Safety: safe"), so unusable answers are retried.
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+OPENROUTER_ATTEMPTS = int(os.getenv("OPENROUTER_ATTEMPTS", "3"))
 # In --loop mode, the next block is prepared as soon as the last queued track
 # starts playing, or earlier if less than this many seconds of music are left
 # in Liquidsoap's queue (so a short last track doesn't leave too little time
@@ -297,7 +302,7 @@ def call_openrouter_json(prompt, purpose):
     }
 
     payload = {
-        "model": "openrouter/free",
+        "model": OPENROUTER_MODEL,
         "messages": [
             {"role": "system", "content": "You are a precise radio automation agent. You always output valid raw JSON."},
             {"role": "user", "content": prompt}
@@ -347,18 +352,34 @@ def call_openrouter_json(prompt, purpose):
         llm_log.warning(f"Empty response ({purpose}) from {model}")
         raise ValueError(f"{model} returned an empty response.")
 
-    # Clean potential markdown code blocks if the model wrapped the JSON anyway
-    if raw_content.startswith("```json"):
-        raw_content = raw_content[7:]
-    if raw_content.endswith("```"):
-        raw_content = raw_content[:-3]
-    raw_content = raw_content.strip()
-
+    # Models sometimes wrap the JSON in a markdown code block or some prose
+    # anyway, so parse from the first "{" to the last "}". strict=False
+    # accepts raw newlines inside strings (e.g. a multi-line DJ script).
+    start, end = raw_content.find("{"), raw_content.rfind("}")
+    json_text = raw_content[start:end + 1] if 0 <= start < end else raw_content
     try:
-        return json.loads(raw_content)
+        parsed = json.loads(json_text, strict=False)
     except json.JSONDecodeError as e:
         llm_log.warning(f"Invalid JSON ({purpose}) from {model}: {e}: {_shorten(raw_content)}")
         raise
+    if not isinstance(parsed, dict):
+        llm_log.warning(f"JSON ({purpose}) from {model} is not an object: {_shorten(raw_content)}")
+        raise ValueError(f"{model} returned JSON that isn't an object.")
+    return parsed
+
+
+def ask_llm_json(prompt, purpose, validate):
+    """call_openrouter_json(), retried up to OPENROUTER_ATTEMPTS times until
+    `validate(parsed)` accepts the answer (it raises ValueError/KeyError on
+    an unusable one) and returns what the caller needs from it. Raises the
+    last error if every attempt fails."""
+    for attempt in range(1, OPENROUTER_ATTEMPTS + 1):
+        try:
+            return validate(call_openrouter_json(prompt, purpose))
+        except (requests.RequestException, ValueError, KeyError) as e:
+            if attempt == OPENROUTER_ATTEMPTS:
+                raise
+            llm_log.info(f"Retrying ({purpose}), attempt {attempt + 1}/{OPENROUTER_ATTEMPTS}, after: {e}")
 
 
 def pick_by_indices(indices, candidates, purpose):
@@ -391,14 +412,20 @@ def curate_artists_and_script(artists, prompt_template, station_name, descriptio
         song_count=song_count,
     )
     log.info("Asking AI to curate artists and write the script...")
-    parsed_data = call_openrouter_json(prompt, "curation")
-    if "dj_script" not in parsed_data or "selected_indices" not in parsed_data:
-        llm_log.warning(f"Curation response is missing fields: {_shorten(json.dumps(parsed_data, ensure_ascii=False))}")
-        raise KeyError("AI response lacks 'selected_indices' or 'dj_script'.")
-    selected = pick_by_indices(parsed_data["selected_indices"], artists, "curation")
-    if len(selected) != song_count:
-        llm_log.warning(f"Asked for {song_count} artist(s), AI picked {len(selected)} valid one(s)")
-    return selected[:song_count], parsed_data["dj_script"]
+
+    def validate(parsed_data):
+        script = parsed_data.get("dj_script")
+        if "selected_indices" not in parsed_data or not isinstance(script, str) or not script.strip():
+            llm_log.warning(f"Curation response is missing fields: {_shorten(json.dumps(parsed_data, ensure_ascii=False))}")
+            raise KeyError("AI response lacks 'selected_indices' or 'dj_script'.")
+        selected = pick_by_indices(parsed_data["selected_indices"], artists, "curation")
+        if not selected:
+            raise ValueError("AI did not select any valid artists.")
+        if len(selected) != song_count:
+            llm_log.warning(f"Asked for {song_count} artist(s), AI picked {len(selected)} valid one(s)")
+        return selected[:song_count], script.strip()
+
+    return ask_llm_json(prompt, "curation", validate)
 
 
 def classify_artists(candidates, prompt_template, station_name, description):
@@ -411,8 +438,13 @@ def classify_artists(candidates, prompt_template, station_name, description):
         description=description,
     )
     log.info(f"Asking AI to classify {len(candidates)} artist(s) against the station's theme...")
-    parsed_data = call_openrouter_json(prompt, "roster")
-    fitting = pick_by_indices(parsed_data.get("selected_indices"), candidates, "roster")
+
+    def validate(parsed_data):
+        if "selected_indices" not in parsed_data:
+            raise KeyError("AI response lacks 'selected_indices'.")
+        return pick_by_indices(parsed_data["selected_indices"], candidates, "roster")
+
+    fitting = ask_llm_json(prompt, "roster", validate)
     non_fitting = [a for a in candidates if a not in fitting]
     return fitting, non_fitting
 
@@ -602,9 +634,6 @@ async def run_station(station_id):
         selected_artists, dj_text = curate_artists_and_script(
             artists_pool, config['prompt'], config['name'], config['description'], song_count
         )
-
-        if len(selected_artists) == 0:
-            raise ValueError("AI did not select any valid artists.")
     except Exception as e:
         log.warning(f"Error during AI curation: {e}. Falling back to random selection and the fallback script.")
         selected_artists = random.sample(artists_pool, min(len(artists_pool), song_count))
