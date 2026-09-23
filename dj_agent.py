@@ -365,12 +365,12 @@ def call_openrouter_json(prompt, purpose):
         raise ValueError(f"{model} returned an empty response.")
 
     # Models sometimes wrap the JSON in a markdown code block or some prose
-    # anyway, so parse from the first "{" to the last "}". strict=False
+    # anyway, or follow it with more text or even a second JSON object, so
+    # parse the first complete object starting at the first "{". strict=False
     # accepts raw newlines inside strings (e.g. a multi-line DJ script).
-    start, end = raw_content.find("{"), raw_content.rfind("}")
-    json_text = raw_content[start:end + 1] if 0 <= start < end else raw_content
+    start = raw_content.find("{")
     try:
-        parsed = json.loads(json_text, strict=False)
+        parsed, _ = json.JSONDecoder(strict=False).raw_decode(raw_content[max(start, 0):])
     except json.JSONDecodeError as e:
         llm_log.warning(f"Invalid JSON ({purpose}) from {model}: {e}: {_shorten(raw_content)}")
         raise
