@@ -73,6 +73,10 @@ DEFAULT_ARTIST_COOLDOWN_FRACTION = 0.1
 # Shorter tracks (intros, interludes, skits...) aren't played, unless a
 # station sets its own min_track_seconds.
 DEFAULT_MIN_TRACK_SECONDS = 90
+# Artists are classified into a station's roster this many per AI request:
+# with hundreds in one numbered list, models lose track of the numbers and
+# pick huge swathes of off-theme artists.
+ROSTER_BATCH_SIZE = 40
 # Every station keeps its own runtime files (intros, roster, play history,
 # fallback list, logs) in STATIONS_DIR/<station_id>/, so they don't clutter
 # the project root or clash with other stations.
@@ -168,8 +172,10 @@ def save_artist_roster(station_id, roster):
     """Persists the artist roster so future runs reuse it instead of
     reclassifying the whole library from scratch."""
     path = get_artists_file(station_id)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(roster, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)  # atomic: the station's agent may be reading it
     log.info(
         f"Saved roster to {path}: {len(roster['allowed'])} allowed, "
         f"{len(roster['banned'])} banned"
@@ -452,25 +458,99 @@ def curate_artists_and_script(artists, prompt_template, station_name, descriptio
     return ask_llm_json(prompt, "curation", validate)
 
 
-def classify_artists(candidates, prompt_template, station_name, description):
-    """Asks the AI which of the candidate artists fit the station's theme.
-    Returns (fitting, non_fitting) — candidates not selected are considered a
-    "no", so the caller can ban them and never ask about them again."""
-    prompt = prompt_template.format(
-        artists_list=format_artist_list(candidates),
-        station_name=station_name,
-        description=description,
-    )
+def describe_artists(artists, config):
+    """One line per artist for the roster prompt: the name plus a couple of
+    its track titles and the folder they're in (e.g. "Eurobeat/..."), which
+    tells the AI far more about an obscure artist than its name alone."""
+    clause, params = track_filter_clause(config)
+    conn = sqlite3.connect(DB_FILE)
+    lines = []
+    for artist in artists:
+        rows = conn.execute(f"""
+            SELECT filepath, title FROM tracks
+            WHERE {clause} AND artist = ?
+            ORDER BY RANDOM() LIMIT 2
+        """, params + [artist]).fetchall()
+        if not rows:
+            lines.append(artist)
+            continue
+        titles = ", ".join(f'"{title}"' for _, title in rows)
+        folder = "/".join(os.path.dirname(rows[0][0]).split(os.sep)[-2:])
+        lines.append(f"{artist} (e.g. {titles}; folder: {folder})")
+    conn.close()
+    return lines
+
+
+def classify_artists(candidates, config):
+    """Asks the AI, ROSTER_BATCH_SIZE artists at a time, which candidates
+    fit the station's theme. Returns (fitting, non_fitting); candidates of a
+    batch the AI didn't answer usably are in neither, so they get asked
+    about again next time instead of being wrongly allowed or banned."""
     log.info(f"Asking AI to classify {len(candidates)} artist(s) against the station's theme...")
+    fitting, non_fitting = [], []
+    for start in range(0, len(candidates), ROSTER_BATCH_SIZE):
+        batch = candidates[start:start + ROSTER_BATCH_SIZE]
+        prompt = config['roster_prompt'].format(
+            artists_list=format_artist_list(describe_artists(batch, config)),
+            station_name=config['name'],
+            description=config['description'],
+        )
 
-    def validate(parsed_data):
-        if "selected_indices" not in parsed_data:
-            raise KeyError("AI response lacks 'selected_indices'.")
-        return pick_by_indices(parsed_data["selected_indices"], candidates, "roster")
+        def validate(parsed_data):
+            if "selected_indices" not in parsed_data:
+                raise KeyError("AI response lacks 'selected_indices'.")
+            return pick_by_indices(parsed_data["selected_indices"], batch, "roster")
 
-    fitting = ask_llm_json(prompt, "roster", validate)
-    non_fitting = [a for a in candidates if a not in fitting]
+        try:
+            batch_fitting = ask_llm_json(prompt, "roster", validate)
+        except Exception as e:
+            log.warning(f"Couldn't classify {len(batch)} artist(s) ({e}); they'll be retried next time.")
+            continue
+        fitting.extend(batch_fitting)
+        non_fitting.extend(a for a in batch if a not in batch_fitting)
+    log.info(
+        f"Classified {len(fitting) + len(non_fitting)} of {len(candidates)} artist(s): "
+        f"{len(fitting)} fit, {len(non_fitting)} don't"
+    )
     return fitting, non_fitting
+
+
+def update_roster(station_id, config, current_artists, rebuild=False):
+    """Loads this station's artist roster (allowed + banned) and brings it
+    up to date with the library, saving any change. Every artist ever seen
+    ends up in either "allowed" or "banned", so only new ones get classified
+    and this stays cheap once the roster has caught up. rebuild=True
+    classifies every artist from scratch instead.
+
+    Some stations don't want AI curation at all (use_ai_roster=false), e.g.
+    a folder that's already a dedicated, niche collection, where AI filtering
+    could wrongly exclude legitimate artists it doesn't recognize. Those just
+    get everything under folder_filter as "allowed"."""
+    roster = {"allowed": [], "banned": []} if rebuild else load_artist_roster(station_id)
+
+    if not config.get('use_ai_roster', True):
+        if set(roster["allowed"]) != set(current_artists) or roster["banned"]:
+            roster["allowed"], roster["banned"] = current_artists, []
+            save_artist_roster(station_id, roster)
+        return roster
+
+    known = set(roster["allowed"]) | set(roster["banned"])
+    new_artists = [a for a in current_artists if a not in known]
+    if not new_artists:
+        return roster
+    if known:
+        log.info(f"Found {len(new_artists)} new artist(s) in the library. Checking if they fit '{config['name']}'...")
+    else:
+        log.info(f"Building the artist roster for '{station_id}' from the whole library...")
+    fitting, non_fitting = classify_artists(new_artists, config)
+    if fitting or non_fitting:
+        roster["allowed"].extend(fitting)
+        roster["banned"].extend(non_fitting)
+        save_artist_roster(station_id, roster)
+        if fitting and known:
+            log.info(f"Added to roster: {', '.join(fitting)}")
+    return roster
+
 
 def ensure_stereo(path):
     """Edge TTS outputs mono MP3s, but some Liquidsoap decoders (e.g. 1.4.x)
@@ -580,56 +660,18 @@ async def run_station(station_id):
     config = load_station_config(station_id)
     dj_audio_file = new_intro_audio_file(station_id)
     song_count = config.get('songs_per_block', DEFAULT_SONGS_PER_BLOCK)
-    use_ai_roster = config.get('use_ai_roster', True)
 
-    # 1. Load this station's artist roster (allowed + banned). Some stations
-    # don't want AI curation at all (use_ai_roster=false) — e.g. a folder
-    # that's already a dedicated, niche collection, where AI filtering could
-    # wrongly exclude legitimate artists it doesn't recognize. Those just get
-    # everything under folder_filter as "allowed".
-    roster = load_artist_roster(station_id)
+    # 1. Bring this station's artist roster up to date with the library.
     current_artists = get_all_artists(config)
-
-    if not use_ai_roster:
-        if set(roster["allowed"]) != set(current_artists) or roster["banned"]:
-            roster["allowed"], roster["banned"] = current_artists, []
-            save_artist_roster(station_id, roster)
-    elif not roster["allowed"] and not roster["banned"]:
-        log.info(f"No artist roster found for '{station_id}'. Building one from the whole library...")
-        if not current_artists:
-            log.error(f"No artists found matching filter: {config['folder_filter']}!")
-            return
-        try:
-            fitting, non_fitting = classify_artists(
-                current_artists, config['roster_prompt'], config['name'], config['description']
-            )
-            if not fitting:
-                raise ValueError("AI did not select any artists for the roster.")
-            roster["allowed"], roster["banned"] = fitting, non_fitting
-        except Exception as e:
-            log.warning(f"Error building artist roster: {e}. Using the full candidate pool instead.")
-            roster["allowed"] = current_artists
-        save_artist_roster(station_id, roster)
-    else:
-        # 1b. Check whether new artists have shown up in the library (e.g. a
-        # rescan) since the roster was last built, and classify only those —
-        # every artist we've ever seen ends up in either "allowed" or
-        # "banned", so this stays cheap once the roster has caught up.
-        known = set(roster["allowed"]) | set(roster["banned"])
-        new_artists = [a for a in current_artists if a not in known]
-        if new_artists:
-            log.info(f"Found {len(new_artists)} new artist(s) in the library. Checking if they fit '{config['name']}'...")
-            try:
-                fitting, non_fitting = classify_artists(
-                    new_artists, config['roster_prompt'], config['name'], config['description']
-                )
-                roster["allowed"].extend(fitting)
-                roster["banned"].extend(non_fitting)
-                save_artist_roster(station_id, roster)
-                if fitting:
-                    log.info(f"Added to roster: {', '.join(fitting)}")
-            except Exception as e:
-                log.warning(f"Error classifying new artists: {e}. Will retry next run.")
+    if not current_artists:
+        log.error(f"No artists found matching filter: {config['folder_filter']}!")
+        return
+    roster = update_roster(station_id, config, current_artists)
+    if not roster["allowed"] and not roster["banned"]:
+        # The AI couldn't classify anything yet (e.g. it's down); play from
+        # the whole library this time, without saving that as the roster.
+        log.warning("No artist roster yet; using every artist in the library for this block.")
+        roster = {"allowed": current_artists, "banned": []}
 
     if not roster["allowed"]:
         log.error(f"Artist roster for '{station_id}' is empty. Nothing to play.")
@@ -776,17 +818,31 @@ async def feed_player(station_id):
 
 
 async def main():
-    args = [a for a in sys.argv[1:] if a != "--loop"]
+    flags = {"--loop", "--rebuild-roster"}
+    args = [a for a in sys.argv[1:] if a not in flags]
     loop_mode = "--loop" in sys.argv[1:]
 
     if len(args) < 1:
-        print("Usage: python dj_agent.py <station_id> [--loop]")
+        print("Usage: python dj_agent.py <station_id> [--loop | --rebuild-roster]")
         return
 
     station_id = args[0]
     load_station_config(station_id)  # fail fast on an unknown station ID
     setup_logging(station_id, get_log_dir(station_id))
     ensure_station_dir(station_id)
+
+    if "--rebuild-roster" in sys.argv[1:]:
+        # Reclassify every artist from scratch. Stop the station's agent
+        # first, or it may save its own (old) roster over this one; Liquidsoap
+        # keeps playing meanwhile.
+        config = load_station_config(station_id)
+        roster = update_roster(station_id, config, get_all_artists(config), rebuild=True)
+        log.info(f"Rebuilt roster: {len(roster['allowed'])} allowed, {len(roster['banned'])} banned", extra=SUMMARY)
+        # The fallback list was drawn from the old roster; the agent
+        # regenerates it from the new one.
+        if os.path.exists(get_fallback_file(station_id)):
+            os.remove(get_fallback_file(station_id))
+        return
 
     if not loop_mode:
         # One-shot: generate a single block and queue it if Liquidsoap is up.

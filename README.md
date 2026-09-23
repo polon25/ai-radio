@@ -53,7 +53,28 @@ On first run (or whenever the file is missing/empty), `dj_agent.py` asks the
 AI to classify every artist in the library against the station's theme —
 `fitting` goes to `allowed`, everything else to `banned`. Every later run
 scans the library for artists it hasn't seen yet and classifies only those,
-so this stays cheap once the roster has caught up with the library. A block
+so this stays cheap once the roster has caught up with the library.
+
+Artists are classified 40 per request (with hundreds in one numbered list,
+models lose track of the numbers and pick huge swathes of off-theme
+artists), each listed with two example track titles and the folder they're
+in, e.g. `Radiorama (e.g. "Chance to Desire", ...; folder: SuperEurobeat/...)`,
+which tells the AI far more than an obscure artist's name alone. Artists in a
+batch the AI couldn't answer usably are left unclassified and asked about
+again next time. The `roster_prompt` should ask the AI to be strict — a
+lenient "include anything that reasonably fits" lets whole neighbouring
+genres in.
+
+To reclassify a station's whole roster (e.g. after changing its
+`roster_prompt` or description), run
+
+```bash
+./venv/bin/python dj_agent.py <station_id> --rebuild-roster
+```
+
+with the station's agent stopped (so it can't save the roster at the same
+time). The station keeps playing from Liquidsoap's queue meanwhile; start
+the agent again when it's done. A block
 that falls back to a random pick (AI request failed) still draws only from
 `allowed`, so it always stays on-theme. You can hand-edit either list at any
 time — an artist you add to `banned` is never asked about again.
