@@ -27,9 +27,10 @@
       ],
       "story_minutes": 2,
       "max_minutes": 15,
+      "avoid_repeat_hours": 3,
       "models": [
-        "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "google/gemma-4-31b-it:free"
+        "google/gemma-4-31b-it:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free"
       ],
       "title": "News",
       "intro": "It's {hour}:00 on {station_name}. In this news segment: {topics}.",

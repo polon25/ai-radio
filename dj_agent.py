@@ -1007,7 +1007,16 @@ def get_news_stories(settings, language, hour):
         def ask_json(prompt, purpose, validate, models=()):
             return ask_llm_json(prompt, purpose, validate, OPENROUTER_BACKGROUND_TIMEOUT, models)
 
-        stories = news.build_stories(settings, language, ask_json)
+        # The last few hours' bulletins (same settings), so they aren't
+        # repeated hour after hour.
+        recent = []
+        for hours_ago in range(1, settings['avoid_repeat_hours'] + 1):
+            earlier = hour - datetime.timedelta(hours=hours_ago)
+            path = os.path.join(NEWS_CACHE_DIR, f"{earlier:%Y%m%d-%H}-{digest}.json")
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    recent.extend(json.load(f))
+        stories = news.build_stories(settings, language, ask_json, recent)
         with open(base + ".json.tmp", "w", encoding="utf-8") as f:
             json.dump(stories, f, ensure_ascii=False, indent=1)
         os.replace(base + ".json.tmp", base + ".json")

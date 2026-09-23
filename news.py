@@ -55,6 +55,7 @@ DEFAULTS = {
     "topics": ["national news", "world news", "politics", "economy"],
     "story_minutes": 2,
     "max_minutes": 15,
+    "avoid_repeat_hours": 3,
     "models": [],
     "title": "News",
     "intro": "It's {hour}:00 on {station_name}. In this news segment: {topics}.",
@@ -215,9 +216,14 @@ def fetch_article_text(url):
     return text[:MAX_ARTICLE_CHARS]
 
 
-def _pick_stories(headlines, settings, ask_json):
+def _recent_listing(recent):
+    return "\n".join(f"- {r.get('topic', '')}: {r.get('headline', '')}" for r in recent)
+
+
+def _pick_stories(headlines, settings, ask_json, recent):
     """The most important distinct stories, most important first: `count`
-    of them plus EXTRA_STORIES to fall back on."""
+    of them plus EXTRA_STORIES to fall back on. Stories in `recent` (aired
+    in the last few hours) are avoided unless there's something new."""
     listing = "\n".join(
         f"{i}. [{h['source']}] {h['title']}" + (f" — {h['summary'][:200]}" if h["summary"] else "")
         for i, h in enumerate(headlines, 1)
@@ -231,8 +237,13 @@ def _pick_stories(headlines, settings, ask_json):
         f"Rules: pick {count} DIFFERENT stories — the same event reported by several sites or in several "
         f"headlines counts once, so pick just one headline for it (the most informative). Only pick real, "
         f"current news about events; never pick ads, TV guides, horoscopes, weather, shopping, services, "
-        f"sport results, celebrity gossip or opinion pieces. List them from most to least important."
-        f"\n\n{listing}\n\n"
+        f"sport results, celebrity gossip or opinion pieces. Spread the picks across the topics above rather "
+        f"than taking several stories on the same one, as long as there's important news for each. List "
+        f"them from most to least important."
+        + (f"\n\nThese stories were already covered in the last {settings['avoid_repeat_hours']} hours' "
+           f"bulletins. Don't pick them (or other headlines about the same events) again, unless the "
+           f"headlines show a significant new development:\n{_recent_listing(recent)}" if recent else "")
+        + f"\n\n{listing}\n\n"
         f"You MUST respond strictly in valid JSON format with no markdown formatting around it, structured "
         f'like this:\n{{"selected_indices": [3, 17, 42, 58]}}'
     )
@@ -252,7 +263,7 @@ def _pick_stories(headlines, settings, ask_json):
     return ask_json(prompt, "news selection", validate, settings["models"])
 
 
-def _write_stories(stories, settings, language, ask_json):
+def _write_stories(stories, settings, language, ask_json, recent):
     target_words = settings["story_minutes"] * WORDS_PER_MINUTE
     max_words = max(target_words, settings["max_minutes"] * WORDS_PER_MINUTE // max(1, len(stories)))
     material = "\n\n".join(
@@ -261,6 +272,7 @@ def _write_stories(stories, settings, language, ask_json):
         + (f"Article:\n{s['text']}" if s["text"] else "")
         for i, s in enumerate(stories, 1)
     )
+    earlier = "\n".join(f"- {r.get('topic', '')}: {r.get('text', '')[:400]}" for r in recent)
     prompt = (
         f"You are a radio news presenter. Rewrite each story below as a spoken news item for radio, in the "
         f"language of locale {language} (e.g. Polish for pl-PL). Each item should take about "
@@ -272,7 +284,11 @@ def _write_stories(stories, settings, language, ask_json):
         f"or making anything up. Use plain, correct spoken sentences with no lists, headings, emojis or "
         f"markdown. "
         f"Also give each story a topic label of 2-4 words in the same language, for the segment's opening "
-        f"line.\n\n{material}\n\n"
+        f"line."
+        + (f"\n\nEarlier bulletins already covered the stories below. If a story here continues one of "
+           f"them, recap it in a sentence at most and focus on what's new, without repeating the same "
+           f"details:\n{earlier}" if recent else "")
+        + f"\n\n{material}\n\n"
         f"You MUST respond strictly in valid JSON format with no markdown formatting around it, structured "
         f'like this:\n{{"stories": [{{"topic": "...", "text": "..."}}]}}'
     )
@@ -319,20 +335,27 @@ def _choose_stories(candidates, count):
     return [s for s in candidates if s in chosen]
 
 
-def build_stories(settings, language, ask_json):
+def build_stories(settings, language, ask_json, recent=()):
     """Collects headlines, has the AI pick settings["count"] stories and
-    write them for radio. Returns [{"topic": ..., "text": ...}]; raises if
-    anything along the way leaves nothing to read."""
+    write them for radio. `recent` holds the stories of the last few hours'
+    bulletins (as returned here before), which aren't repeated unless
+    there's something new. Returns [{"topic", "headline", "text"}]; raises
+    if anything along the way leaves nothing to read."""
+    recent = list(recent)
     headlines = fetch_headlines(settings["sources"])
     if not headlines:
         raise ValueError("No headlines from any news source.")
-    candidates = _pick_stories(headlines, settings, ask_json)
+    candidates = _pick_stories(headlines, settings, ask_json, recent)
     for story in candidates:
         story["text"] = fetch_article_text(story["link"])
     picked = _choose_stories(candidates, settings["count"])
     log.info("Picked stories: " + " | ".join(
         f"[{s['source']}] {s['title']} ({len(s['text'])} chars of article)" for s in picked))
-    return _write_stories(picked, settings, language, ask_json)
+    items = _write_stories(picked, settings, language, ask_json, recent)
+    # Remember what each item was about, for the next bulletins' `recent`.
+    for item, story in zip(items, picked):
+        item["headline"] = story["title"]
+    return items
 
 
 def assemble_script(stories, settings, station_name, hour):

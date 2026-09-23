@@ -151,8 +151,11 @@ Fifteen minutes before, the agent
 
 1. collects headlines from the station's `news.sources` — news sites' front
    pages (links that look like articles) or RSS/Atom feeds,
-2. asks the AI to pick the most important distinct stories, focusing on
-   `topics` — a few more than `count`, most important first,
+2. asks the AI to pick the most important distinct stories, spread across
+   `topics` — a few more than `count`, most important first — leaving out
+   stories covered in the last `avoid_repeat_hours` bulletins unless the
+   headlines show something new (a story that does come back is written as
+   an update, focusing on what's new),
 3. fetches those articles' text (for sites that block it, e.g. the New York
    Times, the feed's summary is used instead) and keeps the `count` most
    important stories whose full article it got, as a summary alone can't
@@ -326,6 +329,8 @@ keyed by station ID:
   - `topics` — what to focus on, e.g. `["national politics", "world news",
     "economy"]`.
   - `story_minutes` — roughly how long each story is read for (default 2).
+  - `avoid_repeat_hours` — how many previous hours' bulletins a story isn't
+    repeated from, unless there's news in it (default 3).
   - `max_minutes` — upper limit on the whole segment's length (default 15).
   - `models` — preferred OpenRouter models for the news, in order (default
     none, i.e. `OPENROUTER_MODEL`). Worth listing large models that write the
