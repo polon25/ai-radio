@@ -25,8 +25,12 @@
         "world news",
         "economy"
       ],
+      "story_minutes": 2,
       "max_minutes": 15,
-      "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "models": [
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "google/gemma-4-31b-it:free"
+      ],
       "title": "News",
       "intro": "It's {hour}:00 on {station_name}. In this news segment: {topics}.",
       "outro": "That's all the news for now. Back to the music."

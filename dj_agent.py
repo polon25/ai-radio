@@ -113,8 +113,10 @@ NEWS_DIR_NAME = "news"
 # News stories shared by all stations with the same news settings, one file
 # per hour, so the AI writes them once (project root; gitignored).
 NEWS_CACHE_DIR = "news_cache"
-# A news segment is prepared this long before the top of the hour it airs at.
-NEWS_PREPARE_MINUTES = 10
+# A news segment is prepared this long before the top of the hour it airs at,
+# and dropped if it's still not ready this long after it.
+NEWS_PREPARE_MINUTES = 15
+NEWS_MAX_LATE_MINUTES = 10
 
 
 def get_station_dir(station_id):
@@ -508,12 +510,17 @@ def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT, model=None
     return parsed
 
 
-def ask_llm_json(prompt, purpose, validate, timeout=OPENROUTER_TIMEOUT, model=None):
+def ask_llm_json(prompt, purpose, validate, timeout=OPENROUTER_TIMEOUT, models=()):
     """call_openrouter_json(), retried up to OPENROUTER_ATTEMPTS times until
     `validate(parsed)` accepts the answer (it raises ValueError/KeyError on
     an unusable one) and returns what the caller needs from it. Raises the
-    last error if every attempt fails."""
+    last error if every attempt fails.
+
+    `models` are preferred models, in order: each attempt moves on to the
+    next one, and once they're used up, attempts go to OPENROUTER_MODEL. So
+    a preferred model that's down, slow or answering badly costs one try."""
     for attempt in range(1, OPENROUTER_ATTEMPTS + 1):
+        model = models[attempt - 1] if attempt <= len(models) else None
         try:
             return validate(call_openrouter_json(prompt, purpose, timeout, model))
         except (requests.RequestException, ValueError, KeyError) as e:
@@ -997,8 +1004,8 @@ def get_news_stories(settings, language, hour):
             with open(base + ".json", encoding="utf-8") as f:
                 return json.load(f)
 
-        def ask_json(prompt, purpose, validate):
-            return ask_llm_json(prompt, purpose, validate, OPENROUTER_BACKGROUND_TIMEOUT, settings.get("model"))
+        def ask_json(prompt, purpose, validate, models=()):
+            return ask_llm_json(prompt, purpose, validate, OPENROUTER_BACKGROUND_TIMEOUT, models)
 
         stories = news.build_stories(settings, language, ask_json)
         with open(base + ".json.tmp", "w", encoding="utf-8") as f:
@@ -1060,7 +1067,10 @@ async def news_loop(station_id):
             settings = news.news_settings(config)
             path = settings and await prepare_news_segment(station_id, config, settings, next_hour)
             await asyncio.sleep(max(0.0, (next_hour - datetime.datetime.now()).total_seconds()))
-            if path:
+            late = (datetime.datetime.now() - next_hour).total_seconds() / 60
+            if path and late > NEWS_MAX_LATE_MINUTES:
+                log.warning(f"The {next_hour:%H:%M} news was ready {late:.0f} min late; skipping it.")
+            elif path:
                 await loop_run(queue_news, player, path, config, settings)
         except OSError as e:
             log.error(f"Couldn't put the news on air, Liquidsoap unreachable: {e}")

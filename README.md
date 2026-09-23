@@ -147,22 +147,25 @@ track titles, in the artist lists the AI classifies rosters from.
 ### News
 
 A station with news sources gets a news segment at the top of every hour.
-Ten minutes before, the agent
+Fifteen minutes before, the agent
 
 1. collects headlines from the station's `news.sources` — news sites' front
    pages (links that look like articles) or RSS/Atom feeds,
-2. asks the AI to pick the `count` most important distinct stories, focusing
-   on `topics`,
+2. asks the AI to pick the most important distinct stories, focusing on
+   `topics` — a few more than `count`, most important first,
 3. fetches those articles' text (for sites that block it, e.g. the New York
-   Times, the feed's summary is used instead),
-4. asks the AI to rewrite each story as a short spoken news item — keeping
-   to the facts in the material, summarizing rather than padding, within a
-   word budget worked out from `max_minutes`,
+   Times, the feed's summary is used instead) and keeps the `count` most
+   important stories whose full article it got, as a summary alone can't
+   fill a couple of minutes without padding,
+4. asks the AI to rewrite each story as a spoken news item of about
+   `story_minutes` — keeping strictly to the facts in the material — and has
+   it rewritten (by the next preferred model) if it comes out far too short,
 5. wraps them in the station's `intro` and `outro` and turns the text into
    speech.
 
 On the hour, `radio.liq` fades out whatever is playing, plays the news, and
-carries on with the next track. Stations with the same news settings share
+carries on with the next track. A segment still not ready 10 minutes past
+the hour is dropped. Stations with the same news settings share
 each hour's stories (written once, cached in `news_cache/`), so only the
 station's name in the intro and its voice differ. `dj_agent.py <station_id>
 --news-now` prepares a segment and puts it on air immediately, e.g. to try
@@ -322,12 +325,14 @@ keyed by station ID:
   - `count` — how many stories (default 4).
   - `topics` — what to focus on, e.g. `["national politics", "world news",
     "economy"]`.
-  - `max_minutes` — upper limit on the segment's length (default 15); the
-    AI is told to summarize, so it's usually much shorter.
-  - `model` — OpenRouter model to write the news with (default
-    `OPENROUTER_MODEL`); worth setting to a large model that writes the
+  - `story_minutes` — roughly how long each story is read for (default 2).
+  - `max_minutes` — upper limit on the whole segment's length (default 15).
+  - `models` — preferred OpenRouter models for the news, in order (default
+    none, i.e. `OPENROUTER_MODEL`). Worth listing large models that write the
     station's language well, since `openrouter/free` sometimes picks small
-    ones that garble it. Falls back to `OPENROUTER_MODEL` if unavailable.
+    ones that garble it. Each retry (error, unusable or too short an answer)
+    moves on to the next model, then to `OPENROUTER_MODEL`, so a preferred
+    model that's down or misbehaving only costs one try.
   - `title` — the segment's title in the stream (default `"News"`).
   - `intro` / `outro` — the segment's fixed opening and closing lines;
     `intro` can use `{hour}`, `{station_name}` and `{topics}` (the stories'

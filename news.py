@@ -37,14 +37,25 @@ ARTICLE_PATH_RE = re.compile(r"(-[^/-]+){3,}|\d{6,}")
 # sites put before headlines.
 HEADLINE_TIME_PREFIX_RE = re.compile(r"^((\d{1,2}:\d{2}|\d+\s*min|\d{1,5})\s+)+", re.IGNORECASE)
 # How much of an article's text the AI gets to summarize.
-MAX_ARTICLE_CHARS = 5000
+MAX_ARTICLE_CHARS = 8000
+# An article with less text than this can't fill a couple of minutes without
+# padding; stories with full articles are preferred (see build_stories).
+MIN_FULL_ARTICLE_CHARS = 1500
+# Stories picked beyond `count`, to fall back on when articles are thin or
+# can't be fetched.
+EXTRA_STORIES = 3
+# A rewrite this far below its word target is redone (by the next model).
+MIN_LENGTH_SHARE = 0.6
+WRITING_TRIES = 3
 # Speaking rate used to turn max_minutes into a word budget.
 WORDS_PER_MINUTE = 140
 
 DEFAULTS = {
     "count": 4,
     "topics": ["national news", "world news", "politics", "economy"],
+    "story_minutes": 2,
     "max_minutes": 15,
+    "models": [],
     "title": "News",
     "intro": "It's {hour}:00 on {station_name}. In this news segment: {topics}.",
     "outro": "That's all the news for now. Back to the music.",
@@ -57,7 +68,10 @@ def news_settings(config):
     news = config.get("news") or {}
     if not news.get("sources"):
         return None
-    return dict(DEFAULTS, **news)
+    settings = dict(DEFAULTS, **news)
+    if isinstance(settings.get("model"), str):  # a single preferred model
+        settings["models"] = [settings["model"]] + list(settings["models"])
+    return settings
 
 
 class _LinkParser(HTMLParser):
@@ -202,11 +216,13 @@ def fetch_article_text(url):
 
 
 def _pick_stories(headlines, settings, ask_json):
+    """The most important distinct stories, most important first: `count`
+    of them plus EXTRA_STORIES to fall back on."""
     listing = "\n".join(
         f"{i}. [{h['source']}] {h['title']}" + (f" — {h['summary'][:200]}" if h["summary"] else "")
         for i, h in enumerate(headlines, 1)
     )
-    count = settings["count"]
+    count = settings["count"] + EXTRA_STORIES
     prompt = (
         f"You are the news editor of a radio station. Below are the current headlines from several news "
         f"sites' front pages (some entries are ads, links to the sites' services or teasers, not news). "
@@ -215,7 +231,8 @@ def _pick_stories(headlines, settings, ask_json):
         f"Rules: pick {count} DIFFERENT stories — the same event reported by several sites or in several "
         f"headlines counts once, so pick just one headline for it (the most informative). Only pick real, "
         f"current news about events; never pick ads, TV guides, horoscopes, weather, shopping, services, "
-        f"sport results, celebrity gossip or opinion pieces.\n\n{listing}\n\n"
+        f"sport results, celebrity gossip or opinion pieces. List them from most to least important."
+        f"\n\n{listing}\n\n"
         f"You MUST respond strictly in valid JSON format with no markdown formatting around it, structured "
         f'like this:\n{{"selected_indices": [3, 17, 42, 58]}}'
     )
@@ -232,11 +249,12 @@ def _pick_stories(headlines, settings, ask_json):
             raise ValueError("AI picked no valid stories.")
         return picked[:count]
 
-    return ask_json(prompt, "news selection", validate)
+    return ask_json(prompt, "news selection", validate, settings["models"])
 
 
 def _write_stories(stories, settings, language, ask_json):
-    max_words = settings["max_minutes"] * WORDS_PER_MINUTE // max(1, len(stories))
+    target_words = settings["story_minutes"] * WORDS_PER_MINUTE
+    max_words = max(target_words, settings["max_minutes"] * WORDS_PER_MINUTE // max(1, len(stories)))
     material = "\n\n".join(
         f"STORY {i} (source: {s['source']})\nHeadline: {s['title']}\n"
         + (f"Summary: {s['summary']}\n" if s["summary"] else "")
@@ -244,12 +262,15 @@ def _write_stories(stories, settings, language, ask_json):
         for i, s in enumerate(stories, 1)
     )
     prompt = (
-        f"You are a radio news presenter. Rewrite each story below as a short spoken news item for radio, "
-        f"in the language of locale {language} (e.g. Polish for pl-PL). Summarize: keep the key facts (who, "
-        f"what, where, when, why), leave out minor details, and stick strictly to what the material says — "
-        f"don't add facts, numbers, quotes, opinions or speculation that aren't in it. If the material is "
-        f"thin, keep the item short rather than padding it. Each item must be at most {max_words} words "
-        f"(usually far fewer is fine), plain spoken sentences with no lists, headings, emojis or markdown. "
+        f"You are a radio news presenter. Rewrite each story below as a spoken news item for radio, in the "
+        f"language of locale {language} (e.g. Polish for pl-PL). Each item should take about "
+        f"{settings['story_minutes']} minutes to read aloud: aim for about {target_words} words (never more "
+        f"than {max_words}). Cover the story properly — what happened, who is involved, the background, "
+        f"reactions and what happens next — using the details in the material, but stick strictly to what "
+        f"the material says: don't add facts, numbers, quotes, opinions or speculation that aren't in it. "
+        f"If the material really is too thin for that length, keep the item shorter rather than padding it "
+        f"or making anything up. Use plain, correct spoken sentences with no lists, headings, emojis or "
+        f"markdown. "
         f"Also give each story a topic label of 2-4 words in the same language, for the segment's opening "
         f"line.\n\n{material}\n\n"
         f"You MUST respond strictly in valid JSON format with no markdown formatting around it, structured "
@@ -266,7 +287,36 @@ def _write_stories(stories, settings, language, ask_json):
             raise ValueError("AI wrote no usable news items.")
         return items
 
-    return ask_json(prompt, "news writing", validate)
+    # Models sometimes write far less than asked; redo a too-short rewrite,
+    # starting with the next preferred model each time, and keep the
+    # longest if none gets there.
+    wanted = MIN_LENGTH_SHARE * target_words * len(stories)
+    models = list(settings["models"])
+    best = None
+    for attempt in range(WRITING_TRIES):
+        rotated = models[attempt:] + models[:attempt] if models else []
+        items = ask_json(prompt, "news writing", validate, rotated)
+        words = sum(len(item["text"].split()) for item in items)
+        if best is None or words > best[0]:
+            best = (words, items)
+        if words >= wanted:
+            break
+        log.info(f"News came out at {words} words, below the ~{int(wanted)} wanted; rewriting.")
+    return best[1]
+
+
+def _choose_stories(candidates, count):
+    """Of the picked stories (most important first), the first `count` whose
+    full article could be fetched, topped up with thinner ones if needed —
+    in their original order."""
+    full = [s for s in candidates if len(s["text"]) >= MIN_FULL_ARTICLE_CHARS]
+    chosen = full[:count]
+    for story in candidates:
+        if len(chosen) >= count:
+            break
+        if story not in chosen:
+            chosen.append(story)
+    return [s for s in candidates if s in chosen]
 
 
 def build_stories(settings, language, ask_json):
@@ -276,10 +326,12 @@ def build_stories(settings, language, ask_json):
     headlines = fetch_headlines(settings["sources"])
     if not headlines:
         raise ValueError("No headlines from any news source.")
-    picked = _pick_stories(headlines, settings, ask_json)
-    log.info("Picked stories: " + " | ".join(f"[{s['source']}] {s['title']}" for s in picked))
-    for story in picked:
+    candidates = _pick_stories(headlines, settings, ask_json)
+    for story in candidates:
         story["text"] = fetch_article_text(story["link"])
+    picked = _choose_stories(candidates, settings["count"])
+    log.info("Picked stories: " + " | ".join(
+        f"[{s['source']}] {s['title']} ({len(s['text'])} chars of article)" for s in picked))
     return _write_stories(picked, settings, language, ask_json)
 
 
@@ -294,6 +346,6 @@ def assemble_script(stories, settings, station_name, hour):
 def cache_key(settings, language):
     """Identifies the news content (not the station), so stations with the
     same sources and topics share one segment's stories per hour."""
-    relevant = {k: settings.get(k) for k in ("sources", "count", "topics", "max_minutes", "model")}
+    relevant = {k: settings.get(k) for k in ("sources", "count", "topics", "story_minutes", "max_minutes", "models")}
     relevant["language"] = language
     return json.dumps(relevant, sort_keys=True, ensure_ascii=False)
