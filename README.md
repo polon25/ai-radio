@@ -147,7 +147,7 @@ track titles, in the artist lists the AI classifies rosters from.
 ### News
 
 A station with news sources gets a news segment at the top of every hour.
-Fifteen minutes before, the agent
+Twenty-five minutes before, the agent
 
 1. collects headlines from the station's `news.sources` — news sites' front
    pages (links that look like articles) or RSS/Atom feeds,
@@ -346,9 +346,9 @@ keyed by station ID:
   - `models` — preferred OpenRouter models for the news, in order (default
     none, i.e. `OPENROUTER_MODEL`). Worth listing large models that write the
     station's language well, since `openrouter/free` sometimes picks small
-    ones that garble it. Each retry (error, unusable or too short an answer)
-    moves on to the next model, then to `OPENROUTER_MODEL`, so a preferred
-    model that's down or misbehaving only costs one try.
+    ones that garble it. Each is tried once, in order (moving on after an
+    error, a timeout, or an unusable or too short answer), before the usual
+    `OPENROUTER_ATTEMPTS` tries with `OPENROUTER_MODEL`.
   - `title` — the segment's title in the stream (default `"News"`).
   - `intro` / `outro` — the segment's fixed opening and closing lines;
     `intro` can use `{hour}`, `{station_name}` and `{topics}` (the stories'

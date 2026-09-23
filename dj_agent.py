@@ -134,7 +134,7 @@ NEWS_CACHE_DIR = "news_cache"
 # queued this long before it (it then plays as soon as the current track
 # ends, i.e. around the top of the hour), and dropped if it's still not ready
 # this long after it.
-NEWS_PREPARE_MINUTES = 15
+NEWS_PREPARE_MINUTES = 25
 NEWS_QUEUE_MINUTES = 2
 NEWS_MAX_LATE_MINUTES = 10
 
@@ -531,22 +531,24 @@ def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT, model=None
 
 
 def ask_llm_json(prompt, purpose, validate, timeout=OPENROUTER_TIMEOUT, models=()):
-    """call_openrouter_json(), retried up to OPENROUTER_ATTEMPTS times until
-    `validate(parsed)` accepts the answer (it raises ValueError/KeyError on
-    an unusable one) and returns what the caller needs from it. Raises the
-    last error if every attempt fails.
+    """call_openrouter_json(), retried until `validate(parsed)` accepts the
+    answer (it raises ValueError/KeyError on an unusable one) and returns
+    what the caller needs from it. Raises the last error if every attempt
+    fails.
 
-    `models` are preferred models, in order: each attempt moves on to the
-    next one, and once they're used up, attempts go to OPENROUTER_MODEL. So
-    a preferred model that's down, slow or answering badly costs one try."""
-    for attempt in range(1, OPENROUTER_ATTEMPTS + 1):
+    `models` are preferred models, tried first, one attempt each, in order;
+    then OPENROUTER_ATTEMPTS attempts go to OPENROUTER_MODEL. So preferred
+    models that are down, slow or answering badly never eat into the usual
+    attempts."""
+    attempts = len(models) + OPENROUTER_ATTEMPTS
+    for attempt in range(1, attempts + 1):
         model = models[attempt - 1] if attempt <= len(models) else None
         try:
             return validate(call_openrouter_json(prompt, purpose, timeout, model))
         except (requests.RequestException, ValueError, KeyError) as e:
-            if attempt == OPENROUTER_ATTEMPTS:
+            if attempt == attempts:
                 raise
-            llm_log.info(f"Retrying ({purpose}), attempt {attempt + 1}/{OPENROUTER_ATTEMPTS}, after: {e}")
+            llm_log.info(f"Retrying ({purpose}), attempt {attempt + 1}/{attempts}, after: {e}")
 
 
 def pick_by_indices(indices, candidates, purpose):
