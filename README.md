@@ -127,6 +127,16 @@ roughly half its tracks are always eligible and picks stay random. If the
 cooldown still leaves fewer artists than a block needs, it's ignored for
 that block.
 
+### Release years and genres
+
+The scanner stores each track's release year (the `originaldate` or `date`
+tag) and genre (the `genre` tag, which is often vague or plain wrong, so
+it's only used as a hint). On a station with `years`, the agent asks the AI
+— in the background, after each library scan — for the original release
+year and genre of its roster's tracks that have none in their tags; each
+track is asked about once. Years and genres also appear, next to example
+track titles, in the artist lists the AI classifies rosters from.
+
 ### Station files
 
 Everything a station generates at runtime lives in its own folder,
@@ -177,7 +187,7 @@ when the scan's process ends, even if it's killed, so it can't go stale.
 
 A scan only opens files it doesn't know yet, plus files indexed by an older
 version of the scanner that didn't read everything it reads now (e.g. track
-lengths), so rescans stay cheap.
+lengths, years, genres), so rescans stay cheap.
 
 ## Setup
 
@@ -264,6 +274,12 @@ keyed by station ID:
   picked. Optional, defaults to `90`.
 - `track_cooldown_hours` — see [Track cooldown](#track-cooldown). Optional,
   defaults to `24`.
+- `years` — `[first, last]` (inclusive) limits the station to tracks
+  released in those years, e.g. `[1970, 1999]` for an oldies station whose
+  artists also released newer music. See [Release years and
+  genres](#release-years-and-genres). Optional; no limit by default.
+- `allow_unknown_year` — whether tracks with no known release year may play
+  on a station with `years`. Optional, defaults to `true`.
 - `roster_prompt` and `prompt` must each produce raw JSON with a
   `selected_indices` field (`prompt` additionally needs `dj_script`); see the
   `ciezki_mlot` entry for the exact contract each is held to. `prompt` can use

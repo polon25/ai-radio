@@ -83,6 +83,8 @@ DEFAULT_TRACK_COOLDOWN_HOURS = 24
 TRACK_COOLDOWN_LIBRARY_SHARE = 0.5
 # Play history older than this is deleted.
 PLAY_HISTORY_DAYS = 30
+# Tracks per AI request when filling in missing release years/genres.
+TRACK_INFO_BATCH_SIZE = 40
 # Artists are classified into a station's roster this many per AI request:
 # with hundreds in one numbered list, models lose track of the numbers and
 # pick huge swathes of off-theme artists.
@@ -262,18 +264,26 @@ def load_station_config(station_id):
         raise ValueError(f"Station '{station_id}' not found in config.")
     return data[station_id]
 
-def track_filter_clause(config):
+def track_filter_clause(config, use_years=True):
     """SQL condition (and its params) selecting the tracks a station may
     play: those under its folder_filter (a single SQL LIKE pattern, or a
     list of patterns OR'd together, so a station can pull from several
-    library folders at once) that are at least min_track_seconds long.
+    library folders at once) that are at least min_track_seconds long and,
+    if the station sets "years": [first, last], released in that range
+    (tracks of unknown year too, unless allow_unknown_year is false).
     Tracks whose length couldn't be read are let through."""
     folder_filter = config['folder_filter']
     patterns = folder_filter if isinstance(folder_filter, list) else [folder_filter]
     folders = " OR ".join(["filepath LIKE ?"] * len(patterns))
     min_seconds = config.get('min_track_seconds', DEFAULT_MIN_TRACK_SECONDS)
     clause = f"({folders}) AND (duration IS NULL OR duration >= ?)"
-    return clause, list(patterns) + [min_seconds]
+    params = list(patterns) + [min_seconds]
+    if use_years and config.get('years'):
+        first, last = config['years']
+        unknown = " OR year IS NULL" if config.get('allow_unknown_year', True) else ""
+        clause += f" AND (year BETWEEN ? AND ?{unknown})"
+        params += [first, last]
+    return clause, params
 
 
 def get_all_artists(config):
@@ -533,23 +543,26 @@ def curate_artists_and_script(artists, prompt_template, station_name, descriptio
 
 def describe_artists(artists, config):
     """One line per artist for the roster prompt: the name plus a couple of
-    its track titles and the folder they're in (e.g. "Eurobeat/..."), which
-    tells the AI far more about an obscure artist than its name alone."""
+    its track titles (with years), their tagged genre and the folder they're
+    in (e.g. "Eurobeat/..."), which tells the AI far more about an obscure
+    artist than its name alone."""
     clause, params = track_filter_clause(config)
     conn = sqlite3.connect(DB_FILE)
     lines = []
     for artist in artists:
         rows = conn.execute(f"""
-            SELECT filepath, title FROM tracks
+            SELECT filepath, title, year, genre FROM tracks
             WHERE {clause} AND artist = ?
             ORDER BY RANDOM() LIMIT 2
         """, params + [artist]).fetchall()
         if not rows:
             lines.append(artist)
             continue
-        titles = ", ".join(f'"{title}"' for _, title in rows)
+        titles = ", ".join(f'"{title}"' + (f" ({year})" if year else "") for _, title, year, _ in rows)
+        genres = sorted({genre for _, _, _, genre in rows if genre})
+        genre = f"; tagged genre: {'/'.join(genres)}" if genres else ""
         folder = "/".join(os.path.dirname(rows[0][0]).split(os.sep)[-2:])
-        lines.append(f"{artist} (e.g. {titles}; folder: {folder})")
+        lines.append(f"{artist} (e.g. {titles}{genre}; folder: {folder})")
     conn.close()
     return lines
 
@@ -757,14 +770,15 @@ async def run_station(station_id):
     # don't repeat every couple of blocks. A roster too small to fill the
     # cooldown gap just ignores it for this round rather than stalling.
     cooldown_fraction = config.get('artist_cooldown_fraction', DEFAULT_ARTIST_COOLDOWN_FRACTION)
-    # Only artists that are still in the library right now: the roster keeps
-    # every artist ever allowed, including ones whose files have since gone
-    # (or that were added by hand), and those have no track to play.
+    # Only artists with a track the station may play right now: the roster
+    # keeps every artist ever allowed, including ones whose files have since
+    # gone (or that were added by hand), or with no track in the station's
+    # years, and those have no track to play.
     in_library = set(current_artists)
     playable = [a for a in roster['allowed'] if a in in_library]
     if len(playable) < len(roster['allowed']):
         gone = [a for a in roster['allowed'] if a not in in_library]
-        log.info(f"Skipping {len(gone)} roster artist(s) not in the library: {', '.join(gone[:10])}")
+        log.info(f"Skipping {len(gone)} roster artist(s) with nothing to play here: {', '.join(gone[:10])}")
     if not playable:
         log.error(f"None of the {len(roster['allowed'])} roster artists are in the library. Nothing to play.")
         return
@@ -842,6 +856,75 @@ async def run_station(station_id):
     return files
 
 
+def fill_missing_track_info(station_id):
+    """For a station limited to certain years, asks the AI for the release
+    year (and genre) of its roster's tracks that have none in their tags, so
+    they can be filtered too. Each track is asked about once; a batch the AI
+    couldn't answer usably is retried next time."""
+    config = load_station_config(station_id)
+    if not config.get('years'):
+        return
+    allowed = set(load_artist_roster(station_id)["allowed"])
+    clause, params = track_filter_clause(config, use_years=False)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    rows = [
+        row for row in conn.execute(f"""
+            SELECT filepath, artist, title, album FROM tracks
+            WHERE {clause} AND (year IS NULL OR genre IS NULL) AND ai_info_checked = 0
+        """, params).fetchall()
+        if row[1] in allowed
+    ]
+    if rows:
+        log.info(f"Asking AI for the release year/genre of {len(rows)} track(s) missing them in their tags...")
+    current_year = time.localtime().tm_year
+    filled = 0
+    for start in range(0, len(rows), TRACK_INFO_BATCH_SIZE):
+        batch = rows[start:start + TRACK_INFO_BATCH_SIZE]
+        listing = "\n".join(
+            f'{i}. {artist} - "{title}" (album: {album})' for i, (_, artist, title, album) in enumerate(batch, 1)
+        )
+        prompt = (
+            "For each of these music tracks, give the year it was first released (the original release, not "
+            "a later remaster or compilation) and its main genre. Use null for anything you don't know; "
+            "don't guess.\n\n" + listing + "\n\nYou MUST respond strictly in valid JSON format with no "
+            'markdown formatting around it, structured like this:\n{"tracks": [{"index": 1, "year": 1984, '
+            '"genre": "Heavy Metal"}, {"index": 2, "year": null, "genre": null}]}'
+        )
+
+        def validate(parsed_data):
+            answers = {}
+            for item in parsed_data.get("tracks") or []:
+                if not isinstance(item, dict) or not isinstance(item.get("index"), int):
+                    continue
+                if not 0 < item["index"] <= len(batch):
+                    continue
+                year, genre = item.get("year"), item.get("genre")
+                year = year if isinstance(year, int) and 1800 <= year <= current_year else None
+                genre = genre.strip() if isinstance(genre, str) and genre.strip() else None
+                answers[item["index"]] = (year, genre)
+            if not answers:
+                raise ValueError("AI answered about none of the tracks.")
+            return answers
+
+        try:
+            answers = ask_llm_json(prompt, "track info", validate)
+        except Exception as e:
+            log.warning(f"Couldn't get track info for {len(batch)} track(s) ({e}); will retry next time.")
+            continue
+        for i, (path, _, _, _) in enumerate(batch, 1):
+            year, genre = answers.get(i, (None, None))
+            filled += year is not None
+            conn.execute(
+                "UPDATE tracks SET year = COALESCE(year, ?), genre = COALESCE(genre, ?), ai_info_checked = 1 "
+                "WHERE filepath = ?",
+                (year, genre, path),
+            )
+        conn.commit()
+    conn.close()
+    if rows:
+        log.info(f"AI filled in the release year of {filled} of {len(rows)} track(s).")
+
+
 def run_scanner_once():
     """Runs scanner.py to (re)index the music library. Several stations may
     each run their own --loop process against the same music_library.db;
@@ -852,11 +935,16 @@ def run_scanner_once():
         log.error(f"scanner.py exited with code {result.returncode}")
 
 
-async def scanner_loop():
-    """Scans once immediately, then every SCAN_INTERVAL_HOURS (if > 0)."""
+async def scanner_loop(station_id):
+    """Scans once immediately, then every SCAN_INTERVAL_HOURS (if > 0), each
+    time followed by filling in missing track info the station needs."""
     loop = asyncio.get_event_loop()
     while True:
         await loop.run_in_executor(None, run_scanner_once)
+        try:
+            await loop.run_in_executor(None, fill_missing_track_info, station_id)
+        except Exception:
+            log.exception("Failed to fill in missing track info")
         if SCAN_INTERVAL_HOURS <= 0:
             return
         await asyncio.sleep(SCAN_INTERVAL_HOURS * 3600)
@@ -966,7 +1054,7 @@ async def main():
 
     # Scan the library in the background: once now, then periodically. Runs
     # independently of block generation, so it never delays playback.
-    asyncio.create_task(scanner_loop())
+    asyncio.create_task(scanner_loop(station_id))
 
     await feed_player(station_id)
 
