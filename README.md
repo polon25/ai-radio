@@ -99,9 +99,10 @@ keyed by station ID:
     "description": "Polskie radio z muzyką metalową",
     "voice": "pl-PL-MarekNeural",
     "folder_filter": "%/Inna muzyka/%",
+    "songs_per_block": 3,
     "fallback_script": "...",
     "roster_prompt": "... {station_name} ... {description} ... {artists_list} ...",
-    "prompt": "... {station_name} ... {description} ... {artists_list} ..."
+    "prompt": "... {station_name} ... {description} ... {artists_list} ... {song_count} ..."
   }
 }
 ```
@@ -109,9 +110,13 @@ keyed by station ID:
 - `folder_filter` is a SQL `LIKE` pattern matched against each track's file
   path in `music_library.db` — this is what scopes a station to a subset of
   the scanned library.
+- `songs_per_block` — how many tracks per generated block (plus the intro).
+  Optional, defaults to 3.
 - `roster_prompt` and `prompt` must each produce raw JSON with a
   `selected_indices` field (`prompt` additionally needs `dj_script`); see the
-  `metal_pl` entry for the exact contract each is held to.
+  `metal_pl` entry for the exact contract each is held to. `prompt` can use
+  `{song_count}` to reference `songs_per_block` instead of hardcoding a
+  number.
 - `voice` is any [Edge TTS voice name](https://github.com/rany2/edge-tts#usage).
 
 ## Running

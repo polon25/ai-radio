@@ -30,6 +30,7 @@ OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "60"))
 BLOCK_LEAD_TIME = int(os.getenv("BLOCK_LEAD_TIME", "15"))
 DB_FILE = "music_library.db"
 CONFIG_FILE = "stations.json"
+DEFAULT_SONGS_PER_BLOCK = 3
 
 
 def get_playlist_file(station_id):
@@ -171,12 +172,14 @@ def call_openrouter_json(prompt):
     return json.loads(raw_content)
 
 
-def curate_artists_and_script(artists, prompt_template, station_name, description):
-    """Asks the AI to pick 3 artists for the next block and write the DJ intro."""
+def curate_artists_and_script(artists, prompt_template, station_name, description, song_count):
+    """Asks the AI to pick `song_count` artists for the next block and write
+    the DJ intro."""
     prompt = prompt_template.format(
         artists_list=format_artist_list(artists),
         station_name=station_name,
         description=description,
+        song_count=song_count,
     )
     print("Asking AI to curate artists and write the script...")
     parsed_data = call_openrouter_json(prompt)
@@ -250,6 +253,7 @@ async def run_station(station_id):
     config = load_station_config(station_id)
     playlist_file = get_playlist_file(station_id)
     dj_audio_file = get_intro_audio_file(station_id)
+    song_count = config.get('songs_per_block', DEFAULT_SONGS_PER_BLOCK)
 
     # 1. Load this station's artist roster (allowed + banned), building it on
     # first run so that even a random fallback pick stays on-theme instead of
@@ -305,7 +309,7 @@ async def run_station(station_id):
     # 3. Ask AI to pick best artists and write intro using prompt from config
     try:
         indices, dj_text = curate_artists_and_script(
-            artists_pool, config['prompt'], config['name'], config['description']
+            artists_pool, config['prompt'], config['name'], config['description'], song_count
         )
         selected_artists = [artists_pool[i - 1] for i in indices if 0 < i <= len(artists_pool)]
 
@@ -313,7 +317,7 @@ async def run_station(station_id):
             raise ValueError("AI did not select any valid artists.")
     except Exception as e:
         print(f"Error during AI curation: {e}. Falling back to random selection.")
-        selected_artists = random.sample(artists_pool, min(len(artists_pool), 3))
+        selected_artists = random.sample(artists_pool, min(len(artists_pool), song_count))
         # Use fallback script defined in JSON config, or default English text if missing
         dj_text = config.get('fallback_script', "Coming up next, some great music on our station.")
 
