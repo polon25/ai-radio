@@ -87,13 +87,25 @@ radio = fallback(track_sensitive=true, [blocks, fallback_tracks])
 # playing" lines). on_track wrapping the final source fires in sync with real
 # playback (unlike e.g. playlist()'s own on_track parameter, which fires for
 # a whole list as soon as it's loaded).
+# Its artist/title are also kept, to resend to Icecast after reconnecting.
+current_title = ref []
 def log_now_playing(m) =
   log.important(label="now_playing", json_of(compact=true, m))
+  current_title := list.filter(fun (kv) -> fst(kv) == "artist" or fst(kv) == "title", m)
 end
 
 # mksafe plays silence if there's nothing at all to play (e.g. the fallback
 # list isn't written yet); it shows up in the logs as a track with no filename
 safe_radio = on_track(log_now_playing, mksafe(radio))
+
+# Icecast only learns the stream's title when a track starts, so after it
+# restarts (or the connection drops) it would show no title until the next
+# track. On every (re)connection, re-insert the current track's artist/title.
+with_title = insert_metadata(safe_radio)
+insert_title = fst(with_title)
+def resend_title() =
+  if !current_title != [] then insert_title(new_track=false, !current_title) end
+end
 
 # Lets dj_agent.py see how much of the current track is left.
 server.register(
@@ -112,5 +124,6 @@ output.icecast(
   description = stream_field("description", ""),
   genre = stream_field("genre", ""),
   url = stream_field("url", ""),
-  safe_radio
+  on_connect = resend_title,
+  snd(with_title)
 )
