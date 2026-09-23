@@ -82,7 +82,10 @@ fallback_tracks = playlist(
 )
 
 # track_sensitive: only ever switch between the two at track boundaries.
-music = fallback(track_sensitive=true, [blocks, fallback_tracks])
+# dj_agent.py tags each song with a gain that evens out the volume between
+# tracks (liq_amplify, e.g. "-3.5dB"), which amplify applies; DJ intros and
+# news come without one, already at a matching loudness.
+music = amplify(1., override="liq_amplify", fallback(track_sensitive=true, [blocks, fallback_tracks]))
 
 # Report every track as it starts playing, with its metadata as JSON, under
 # the "now_playing" label (dj_agent.py turns these into readable "Now

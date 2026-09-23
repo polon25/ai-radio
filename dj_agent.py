@@ -4,6 +4,7 @@ import sys
 import json
 import logging
 import random
+import re
 import subprocess
 import time
 import requests
@@ -22,6 +23,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import news
+import scanner
 from liquidsoap_client import NEWS_QUEUE_ID, Liquidsoap
 from radio_log import (
     LIQUIDSOAP_SPOOL_FILE, SUMMARY, LiquidsoapLogForwarder, setup_logging,
@@ -60,6 +62,16 @@ BLOCK_RETRY_DELAY = 15
 # their peaks (which leaves them about 1.5 LU below it): a little below the
 # typical mastered music they play between, which is often around -8.
 SPEECH_LOUDNESS_LUFS = float(os.getenv("SPEECH_LOUDNESS_LUFS", "-10"))
+# Music is evened out to this loudness (LUFS) by a per-track gain (applied by
+# radio.liq's amplify). Louder tracks are always brought down to it; quieter
+# ones are only raised as far as their peaks allow (staying below
+# MUSIC_MAX_PEAK_DBTP rather than clipping), which with most of today's
+# masters peaking near 0 dB is often not at all. Hence a target a little
+# below typical mastered music (around -8): it takes the loudest tracks down
+# the most, where the difference was most noticeable.
+MUSIC_LOUDNESS_LUFS = float(os.getenv("MUSIC_LOUDNESS_LUFS", "-13"))
+MUSIC_MAX_PEAK_DBTP = -1.0
+MUSIC_GAIN_RANGE_DB = (-20.0, 12.0)
 # Edge TTS is an online service: seconds to wait before each retry (so one
 # try more than there are delays) before a block goes on air without its
 # intro. Blocks are prepared minutes ahead, so this can ride out a DNS or
@@ -779,7 +791,7 @@ def refresh_fallback_list(station_id):
             tracks.append(track[0])
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
-        f.writelines(f"{track}\n" for track in tracks)
+        f.writelines(f"{music_uri(track)}\n" for track in tracks)
     os.replace(tmp_path, path)  # atomic, so Liquidsoap never reads half a file
     log.info(f"Refreshed the fallback list: {len(tracks)} track(s)")
 
@@ -809,13 +821,69 @@ class QueueState:
         self.seconds_left = seconds
 
 
+def measure_loudness(path):
+    """A file's integrated loudness (LUFS) and true peak (dBTP), per EBU
+    R128. Decodes the whole file, so it takes a second or two."""
+    output = subprocess.run(
+        [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-nostats", "-i", path,
+         "-af", "ebur128=peak=true", "-f", "null", "-"],
+        check=True, capture_output=True, text=True,
+    ).stderr
+    summary = output[output.rindex("Summary:"):]
+    loudness = float(re.search(r"I:\s+(-?[\d.]+) LUFS", summary).group(1))
+    peak = float(re.search(r"Peak:\s+(-?[\d.]+|-inf) dBFS", summary).group(1))
+    return loudness, peak
+
+
+def music_gain(path):
+    """The gain (dB) that brings a track towards MUSIC_LOUDNESS_LUFS (see
+    there), or None if it can't be measured. Measured once per track and
+    kept in the library database."""
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    try:
+        row = conn.execute("SELECT loudness, true_peak FROM tracks WHERE filepath = ?", (path,)).fetchone()
+        if row and row[0] is not None:
+            loudness, peak = row
+        else:
+            try:
+                loudness, peak = measure_loudness(path)
+            except Exception as e:
+                log.warning(f"Couldn't measure the loudness of {path}: {e}")
+                return None
+            conn.execute("UPDATE tracks SET loudness = ?, true_peak = ? WHERE filepath = ?", (loudness, peak, path))
+            conn.commit()
+    finally:
+        conn.close()
+    gain = MUSIC_LOUDNESS_LUFS - loudness
+    if gain > 0:
+        # Raise only as far as the peaks allow, but never lower a quiet
+        # track just because it peaks high.
+        gain = min(gain, max(0.0, MUSIC_MAX_PEAK_DBTP - peak))
+    low, high = MUSIC_GAIN_RANGE_DB
+    return max(low, min(high, gain))
+
+
+def music_uri(path):
+    """A track's URI for Liquidsoap, carrying its loudness gain (see
+    music_gain) for radio.liq's amplify."""
+    gain = music_gain(path)
+    return path if gain is None else f'annotate:liq_amplify="{gain:+.1f}dB":{path}'
+
+
 def queue_block(player, files, station_name):
     """Pushes a block's files onto Liquidsoap's queue, in play order. The
     DJ intro has no tags of its own, so it's given the station's name as
-    artist and "DJ" as title for the stream's "now playing"."""
+    artist and "DJ" as title for the stream's "now playing"; songs carry
+    their loudness gain."""
+    gains = []
     for path in files:
-        is_intro = os.path.basename(os.path.dirname(path)) == INTROS_DIR_NAME
-        player.push(path, {"artist": station_name, "title": "DJ"} if is_intro else None)
+        if os.path.basename(os.path.dirname(path)) == INTROS_DIR_NAME:
+            player.push(path, {"artist": station_name, "title": "DJ"})
+            continue
+        gain = music_gain(path)
+        gains.append("?" if gain is None else f"{gain:+.1f}")
+        player.push(path, None if gain is None else {"liq_amplify": f"{gain:+.1f}dB"})
+    return gains
 
 
 async def run_station(station_id):
@@ -1201,8 +1269,8 @@ async def feed_player(station_id):
             continue
         try:
             station_name = load_station_config(station_id)['name']
-            await loop.run_in_executor(None, queue_block, player, files, station_name)
-            log.info(f"Queued the block ({len(files)} files).")
+            gains = await loop.run_in_executor(None, queue_block, player, files, station_name)
+            log.info(f"Queued the block ({len(files)} files; song gains {', '.join(gains)} dB).")
         except OSError as e:
             log.error(f"Couldn't queue the block, Liquidsoap unreachable ({e}); it will be regenerated.")
             await asyncio.sleep(QUEUE_POLL_INTERVAL)
@@ -1221,6 +1289,9 @@ async def main():
     load_station_config(station_id)  # fail fast on an unknown station ID
     setup_logging(station_id, get_log_dir(station_id))
     ensure_station_dir(station_id)
+    # Bring the library's schema up to date (new columns) before anything
+    # queries it; the background scan that would do it may not have run yet.
+    scanner.create_database().close()
 
     if "--rebuild-roster" in sys.argv[1:]:
         # Reclassify every artist from scratch. Stop the station's agent

@@ -34,6 +34,11 @@ ADDED_COLUMNS = [
     ("genre", "TEXT"),  # from the tags (often vague) or filled in by the AI
     # Whether dj_agent.py already asked the AI for a missing year/genre
     ("ai_info_checked", "INTEGER NOT NULL DEFAULT 0"),
+    # Integrated loudness (LUFS) and true peak (dBTP), measured by
+    # dj_agent.py the first time a track is played (decoding every file up
+    # front would take hours), to even out the volume between tracks.
+    ("loudness", "REAL"),
+    ("true_peak", "REAL"),
 ]
 # Commit every this many tracks, so a long (re)scan never holds the database
 # for long.
