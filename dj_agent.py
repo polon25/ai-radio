@@ -718,10 +718,13 @@ def refresh_fallback_list(station_id):
     path = get_fallback_file(station_id)
     if os.path.exists(path) and time.time() - os.path.getmtime(path) < FALLBACK_REFRESH_HOURS * 3600:
         return
-    artists = load_artist_roster(station_id)["allowed"]
+    config = load_station_config(station_id)
+    # Only roster artists with a track the station may play (e.g. within
+    # its years), so the list isn't left short.
+    playable = set(get_all_artists(config))
+    artists = [a for a in load_artist_roster(station_id)["allowed"] if a in playable]
     if not artists:
         return  # no roster yet; the first block builds it
-    config = load_station_config(station_id)
     tracks = []
     for artist in random.sample(artists, min(len(artists), FALLBACK_TRACKS)):
         track = get_track_by_artist(artist, config)
