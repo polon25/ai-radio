@@ -8,6 +8,7 @@ import subprocess
 import time
 import requests
 import asyncio
+import collections
 import edge_tts
 import imageio_ffmpeg
 from mutagen import File as MutagenFile
@@ -92,6 +93,11 @@ TRACK_INFO_BATCH_SIZE = 40
 # with hundreds in one numbered list, models lose track of the numbers and
 # pick huge swathes of off-theme artists.
 ROSTER_BATCH_SIZE = 40
+# Each batch is classified this many times (openrouter/free picks a
+# different model each time, and their answers vary a lot: one picks exactly
+# the right artists, the next half the list) and an artist gets in only if
+# most of the answers picked it.
+ROSTER_VOTES = 3
 # Every station keeps its own runtime files (intros, roster, play history,
 # fallback list, logs) in STATIONS_DIR/<station_id>/, so they don't clutter
 # the project root or clash with other stations.
@@ -572,9 +578,11 @@ def describe_artists(artists, config):
 
 def classify_artists(candidates, config):
     """Asks the AI, ROSTER_BATCH_SIZE artists at a time, which candidates
-    fit the station's theme. Returns (fitting, non_fitting); candidates of a
-    batch the AI didn't answer usably are in neither, so they get asked
-    about again next time instead of being wrongly allowed or banned."""
+    fit the station's theme, ROSTER_VOTES times per batch; an artist fits if
+    a majority of the answers picked it. Returns (fitting, non_fitting);
+    candidates of a batch that got fewer than two usable answers are in
+    neither, so they get asked about again next time instead of being
+    decided by a single (possibly bad) answer."""
     log.info(f"Asking AI to classify {len(candidates)} artist(s) against the station's theme...")
     fitting, non_fitting = [], []
     for start in range(0, len(candidates), ROSTER_BATCH_SIZE):
@@ -590,11 +598,24 @@ def classify_artists(candidates, config):
                 raise KeyError("AI response lacks 'selected_indices'.")
             return pick_by_indices(parsed_data["selected_indices"], batch, "roster")
 
-        try:
-            batch_fitting = ask_llm_json(prompt, "roster", validate, OPENROUTER_BACKGROUND_TIMEOUT)
-        except Exception as e:
-            log.warning(f"Couldn't classify {len(batch)} artist(s) ({e}); they'll be retried next time.")
+        votes = collections.Counter()
+        answers = 0
+        for _ in range(ROSTER_VOTES):
+            try:
+                votes.update(ask_llm_json(prompt, "roster", validate, OPENROUTER_BACKGROUND_TIMEOUT))
+                answers += 1
+            except Exception as e:
+                log.warning(f"One classification of {len(batch)} artist(s) failed ({e}).")
+        if answers < 2:
+            log.warning(f"Too few answers to classify {len(batch)} artist(s); they'll be retried next time.")
             continue
+        majority = answers // 2 + 1
+        batch_fitting = [a for a in batch if votes[a] >= majority]
+        disputed = [a for a in batch if 0 < votes[a] < majority]
+        log.info(
+            f"Batch of {len(batch)}: {len(batch_fitting)} fit by majority of {answers} answers"
+            + (f"; outvoted: {', '.join(disputed)}" if disputed else "")
+        )
         fitting.extend(batch_fitting)
         non_fitting.extend(a for a in batch if a not in batch_fitting)
     log.info(

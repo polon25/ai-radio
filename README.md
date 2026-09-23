@@ -62,9 +62,12 @@ Artists are classified 40 per request (with hundreds in one numbered list,
 models lose track of the numbers and pick huge swathes of off-theme
 artists), each listed with two example track titles and the folder they're
 in, e.g. `Radiorama (e.g. "Chance to Desire", ...; folder: SuperEurobeat/...)`,
-which tells the AI far more than an obscure artist's name alone. Artists in a
-batch the AI couldn't answer usably are left unclassified and asked about
-again next time. The `roster_prompt` should ask the AI to be strict — a
+which tells the AI far more than an obscure artist's name alone. Each batch
+is classified three times — `openrouter/free` picks a different model each
+time, and their answers vary a lot (one picks exactly the right artists,
+the next half the list) — and an artist gets in only if most answers picked
+it. Artists in a batch with fewer than two usable answers are left
+unclassified and asked about again next time. The `roster_prompt` should ask the AI to be strict — a
 lenient "include anything that reasonably fits" lets whole neighbouring
 genres in.
 
