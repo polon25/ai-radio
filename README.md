@@ -255,6 +255,7 @@ lengths, years, genres), so rescans stay cheap.
    | `OPENROUTER_TIMEOUT` | Optional; seconds a whole OpenRouter request for a block (artist picks + DJ script) may take before it's given up on (default 60) |
    | `OPENROUTER_BACKGROUND_TIMEOUT` | Optional; the same for background work nothing on air waits for — classifying artists, filling in track info (default 180) |
    | `OPENROUTER_MODEL` | Optional; OpenRouter model to use (default `openrouter/free`, which picks some free model per request) |
+   | `SPEECH_LOUDNESS_LUFS` | Optional; loudness DJ intros and news are raised to before a limiter shaves their peaks, which leaves them about 1.5-2 LU below it (default -10, i.e. about -12; Edge TTS speech is around -20, most mastered music around -8) |
    | `OPENROUTER_ATTEMPTS` | Optional; how many times a request whose answer is unusable (not JSON, missing fields, no valid artists) is tried before falling back to a random pick and the station's `fallback_script` (default 3) |
    | `BLOCK_LEAD_TIME` | Optional; the next block is prepared once the last queued track starts, or as soon as less than this many seconds of music are left in the queue (default 120) |
    | `LOG_RETENTION_DAYS` | Optional; days of daily [log files](#logs) to keep (default 7) |

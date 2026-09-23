@@ -56,6 +56,10 @@ BLOCK_LEAD_TIME = int(os.getenv("BLOCK_LEAD_TIME", "120"))
 # before retrying a block that failed to generate.
 QUEUE_POLL_INTERVAL = 5
 BLOCK_RETRY_DELAY = 15
+# Loudness (LUFS) DJ intros and news are raised to, before a limiter shaves
+# their peaks (which leaves them about 1.5 LU below it): a little below the
+# typical mastered music they play between, which is often around -8.
+SPEECH_LOUDNESS_LUFS = float(os.getenv("SPEECH_LOUDNESS_LUFS", "-10"))
 # Edge TTS is an online service: seconds to wait before each retry (so one
 # try more than there are delays) before a block goes on air without its
 # intro. Blocks are prepared minutes ahead, so this can ride out a DNS or
@@ -691,15 +695,29 @@ def update_roster(station_id, config, current_artists, rebuild=False, classify=T
     return roster
 
 
-def ensure_stereo(path):
-    """Edge TTS outputs mono MP3s, but some Liquidsoap decoders (e.g. 1.4.x)
-    require the file's channel count to exactly match `frame.audio.channels`
-    (2 by default) and refuse to play anything else. Re-encode in place with
-    the channel duplicated to stereo so it can actually be played."""
+def finish_speech_audio(path):
+    """Re-encodes Edge TTS output in place so it plays well between songs:
+
+    - Edge TTS outputs mono MP3s, but some Liquidsoap decoders (e.g. 1.4.x)
+      require the file's channel count to exactly match
+      `frame.audio.channels` (2 by default) and refuse to play anything
+      else, so the channel is duplicated to stereo.
+    - Its speech is around -20 LUFS, far quieter than most mastered music
+      (around -8), so it's normalized to SPEECH_LOUDNESS_LUFS."""
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    tmp_path = f"{path}.stereo.tmp.mp3"
+    # Measure, then raise the level by the difference, with a limiter
+    # catching the few peaks that would clip (loudnorm alone won't raise
+    # speech that far without exceeding its peak limit).
+    measured = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", path, "-af", "loudnorm=print_format=json", "-f", "null", "-"],
+        check=True, capture_output=True, text=True,
+    ).stderr
+    loudness = float(json.loads(measured[measured.rindex("{"):measured.rindex("}") + 1])["input_i"])
+    gain = SPEECH_LOUDNESS_LUFS - loudness
+    tmp_path = f"{path}.finished.tmp.mp3"
     subprocess.run(
-        [ffmpeg, "-y", "-i", path, "-ac", "2", tmp_path],
+        [ffmpeg, "-y", "-i", path, "-af", f"volume={gain:.1f}dB,alimiter=limit=0.84:level=false",
+         "-ar", "44100", "-ac", "2", "-b:a", "128k", tmp_path],
         check=True, capture_output=True,
     )
     os.replace(tmp_path, path)
@@ -715,7 +733,7 @@ async def generate_audio(text, output_file, voice):
         try:
             communicate = edge_tts.Communicate(text, voice)
             await communicate.save(output_file)
-            ensure_stereo(output_file)
+            finish_speech_audio(output_file)
             return True
         except Exception as e:
             log.warning(f"Intro speech synthesis failed (attempt {attempt}/{attempts}): {e!r}")
