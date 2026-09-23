@@ -137,6 +137,7 @@ NEWS_CACHE_DIR = "news_cache"
 NEWS_PREPARE_MINUTES = 25
 NEWS_QUEUE_MINUTES = 2
 NEWS_MAX_LATE_MINUTES = 10
+NEWS_RETRY_SECONDS = 60
 
 
 def get_station_dir(station_id):
@@ -1193,6 +1194,14 @@ async def news_loop(station_id):
                 log.info(f"The {next_hour:%H:%M} news is already queued.")
                 settings = None
             path = settings and await prepare_news_segment(station_id, config, settings, next_hour)
+            # A failed attempt (every model timing out, say) is retried while
+            # there's still time to air it; each retry is also a chance to
+            # pick up stories another station has written meanwhile.
+            deadline = next_hour + datetime.timedelta(minutes=NEWS_MAX_LATE_MINUTES)
+            while settings and not path and datetime.datetime.now() + datetime.timedelta(seconds=NEWS_RETRY_SECONDS) < deadline:
+                log.info(f"Retrying the {next_hour:%H:%M} news in {NEWS_RETRY_SECONDS}s.")
+                await asyncio.sleep(NEWS_RETRY_SECONDS)
+                path = await prepare_news_segment(station_id, config, settings, next_hour)
             queue_at = next_hour - datetime.timedelta(minutes=NEWS_QUEUE_MINUTES)
             await asyncio.sleep(max(0.0, (queue_at - datetime.datetime.now()).total_seconds()))
             late = (datetime.datetime.now() - next_hour).total_seconds() / 60

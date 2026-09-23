@@ -177,7 +177,8 @@ between a couple of minutes early and one track late — then carries on with
 the next track. (Cutting into the current track isn't reliable on Liquidsoap
 1.4: skipping a source that isn't playing, or one inside a `fallback`,
 either doesn't skip it or skips a track too many.) A segment still not ready
-10 minutes past the hour is dropped. Stations with the same news settings share
+10 minutes past the hour is dropped; until then, a failed attempt is retried
+every minute. Stations with the same news settings share
 each hour's stories (written once, cached in `news_cache/`), so only the
 station's name in the intro and its voice differ. `dj_agent.py <station_id>
 --news-now` prepares a segment and queues it right away, e.g. to try
