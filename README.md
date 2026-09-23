@@ -151,8 +151,9 @@ Fifteen minutes before, the agent
 
 1. collects headlines from the station's `news.sources` — news sites' front
    pages (links that look like articles) or RSS/Atom feeds,
-2. asks the AI to pick the most important distinct stories, spread across
-   `topics` — a few more than `count`, most important first — leaving out
+2. asks the AI to pick the most important distinct stories — normally at
+   least one for each of the `topics`, unless there's good reason not to —
+   a few more than `count`, most important first, leaving out
    stories covered in the last `avoid_repeat_hours` bulletins unless the
    headlines show something new (a story that does come back is written as
    an update, focusing on what's new),
@@ -161,8 +162,10 @@ Fifteen minutes before, the agent
    important stories whose full article it got, as a summary alone can't
    fill a couple of minutes without padding,
 4. asks the AI to rewrite each story as a spoken news item of about
-   `story_minutes` — keeping strictly to the facts in the material — and has
-   it rewritten (by the next preferred model) if it comes out far too short,
+   `story_minutes` — keeping strictly to the facts in the material, with no
+   filler — plus a one-sentence summary of it for the segment's opening, and
+   has it rewritten (by the next preferred model) if it comes out far too
+   short,
 5. wraps them in the station's `intro` and `outro` and turns the text into
    speech.
 
@@ -346,7 +349,7 @@ keyed by station ID:
   - `title` — the segment's title in the stream (default `"News"`).
   - `intro` / `outro` — the segment's fixed opening and closing lines;
     `intro` can use `{hour}`, `{station_name}` and `{topics}` (the stories'
-    topic labels). They default to English.
+    one-sentence summaries, one after another). They default to English.
   The news is written in the language of the station's `voice` (e.g. Polish
   for `pl-PL-...`).
 - `roster_prompt` and `prompt` must each produce raw JSON with a

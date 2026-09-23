@@ -58,7 +58,7 @@ DEFAULTS = {
     "avoid_repeat_hours": 3,
     "models": [],
     "title": "News",
-    "intro": "It's {hour}:00 on {station_name}. In this news segment: {topics}.",
+    "intro": "It's {hour}:00 on {station_name}. Here's what's in the news: {topics}",
     "outro": "That's all the news for now. Back to the music.",
 }
 
@@ -237,9 +237,10 @@ def _pick_stories(headlines, settings, ask_json, recent):
         f"Rules: pick {count} DIFFERENT stories — the same event reported by several sites or in several "
         f"headlines counts once, so pick just one headline for it (the most informative). Only pick real, "
         f"current news about events; never pick ads, TV guides, horoscopes, weather, shopping, services, "
-        f"sport results, celebrity gossip or opinion pieces. Spread the picks across the topics above rather "
-        f"than taking several stories on the same one, as long as there's important news for each. List "
-        f"them from most to least important."
+        f"sport results, celebrity gossip or opinion pieces. Normally include at least one story for each "
+        f"of the topics above rather than several on the same one; only depart from that for a good reason, "
+        f"e.g. there's no real news for a topic, or one topic has several stories clearly more important "
+        f"than anything else. List them from most to least important."
         + (f"\n\nThese stories were already covered in the last {settings['avoid_repeat_hours']} hours' "
            f"bulletins. Don't pick them (or other headlines about the same events) again, unless the "
            f"headlines show a significant new development:\n{_recent_listing(recent)}" if recent else "")
@@ -281,24 +282,28 @@ def _write_stories(stories, settings, language, ask_json, recent):
         f"reactions and what happens next — using the details in the material, but stick strictly to what "
         f"the material says: don't add facts, numbers, quotes, opinions or speculation that aren't in it. "
         f"If the material really is too thin for that length, keep the item shorter rather than padding it "
-        f"or making anything up. Use plain, correct spoken sentences with no lists, headings, emojis or "
-        f"markdown. "
-        f"Also give each story a topic label of 2-4 words in the same language, for the segment's opening "
-        f"line."
+        f"or making anything up. No filler: don't repeat what you've already said, don't restate the "
+        f"headline at the end, and skip empty phrases and generic commentary — every sentence should add "
+        f"information. Use plain, correct spoken sentences with no lists, headings, emojis or markdown. "
+        f"Also give each story a one-sentence summary in the same language (a full sentence of about 10-20 "
+        f"words, ending with a full stop), which the segment's opening reads out as its list of topics."
         + (f"\n\nEarlier bulletins already covered the stories below. If a story here continues one of "
            f"them, recap it in a sentence at most and focus on what's new, without repeating the same "
            f"details:\n{earlier}" if recent else "")
         + f"\n\n{material}\n\n"
         f"You MUST respond strictly in valid JSON format with no markdown formatting around it, structured "
-        f'like this:\n{{"stories": [{{"topic": "...", "text": "..."}}]}}'
+        f'like this:\n{{"stories": [{{"summary": "...", "text": "..."}}]}}'
     )
 
     def validate(parsed):
         items = []
         for item in parsed.get("stories") or []:
             if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip():
-                topic = item.get("topic") if isinstance(item.get("topic"), str) else ""
-                items.append({"topic": topic.strip(), "text": item["text"].strip()})
+                topic = item.get("summary") or item.get("topic")
+                topic = topic.strip() if isinstance(topic, str) else ""
+                if topic and topic[-1] not in ".!?":
+                    topic += "."
+                items.append({"topic": topic, "text": item["text"].strip()})
         if not items:
             raise ValueError("AI wrote no usable news items.")
         return items
@@ -360,8 +365,9 @@ def build_stories(settings, language, ask_json, recent=()):
 
 def assemble_script(stories, settings, station_name, hour):
     """The segment's full text: the configured intro (with the hour, station
-    name and topics), the stories, and the configured outro."""
-    topics = ", ".join(s["topic"] for s in stories if s["topic"])
+    name and the stories' one-sentence summaries as {topics}), the stories,
+    and the configured outro."""
+    topics = " ".join(s["topic"] for s in stories if s["topic"])
     intro = settings["intro"].format(hour=hour, station_name=station_name, topics=topics)
     return "\n\n".join([intro] + [s["text"] for s in stories] + [settings["outro"]])
 

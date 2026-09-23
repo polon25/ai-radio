@@ -33,7 +33,7 @@
         "nvidia/nemotron-3-ultra-550b-a55b:free"
       ],
       "title": "News",
-      "intro": "It's {hour}:00 on {station_name}. In this news segment: {topics}.",
+      "intro": "It's {hour}:00 on {station_name}. Here's what's in the news: {topics}",
       "outro": "That's all the news for now. Back to the music."
     }
   },
