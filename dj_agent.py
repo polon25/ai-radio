@@ -36,6 +36,10 @@ DB_FILE = "music_library.db"
 CONFIG_FILE = "stations.json"
 SCAN_LOCK_FILE = "scanner.lock"
 DEFAULT_SONGS_PER_BLOCK = 3
+# Fraction of a station's artist pool that must play before an artist can
+# repeat, e.g. 0.1 with a 70-artist roster means 7 other songs minimum
+# between two plays of the same artist. 0 disables the cooldown.
+DEFAULT_ARTIST_COOLDOWN_FRACTION = 0.1
 
 
 def get_playlist_file(station_id):
@@ -83,6 +87,48 @@ def save_artist_roster(station_id, roster):
         f"Saved roster to {path}: {len(roster['allowed'])} allowed, "
         f"{len(roster['banned'])} banned"
     )
+
+
+def get_recent_artists_file(station_id):
+    """Path to this station's recently-played-artists history, used to
+    enforce the artist cooldown."""
+    return f"recent_artists_{station_id}.json"
+
+
+def load_recent_artists(station_id):
+    """Loads the play history (oldest first). Missing/corrupt file -> none."""
+    path = get_recent_artists_file(station_id)
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            return []
+    return data if isinstance(data, list) else []
+
+
+def save_recent_artists(station_id, history):
+    """Persists the play history, trimmed so the file doesn't grow forever."""
+    path = get_recent_artists_file(station_id)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(history[-500:], f, ensure_ascii=False)
+
+
+def artist_cooldown(pool_size, fraction):
+    """How many other songs must play before an artist already in `history`
+    is eligible again."""
+    if fraction <= 0:
+        return 0
+    return max(1, round(pool_size * fraction))
+
+
+def filter_by_cooldown(artists, history, cooldown):
+    """Drops artists who played within the last `cooldown` songs."""
+    if cooldown <= 0:
+        return list(artists)
+    recently_played = set(history[-cooldown:])
+    return [a for a in artists if a not in recently_played]
 
 
 def load_station_config(station_id):
@@ -327,8 +373,17 @@ async def run_station(station_id):
 
     print(f"--- Starting artist curation for station: {station_id} ({len(roster['allowed'])} artists in roster) ---")
 
-    # 2. Offer the AI a random subset of the roster for this block (keeps the prompt small)
-    artists_pool = random.sample(roster["allowed"], min(len(roster["allowed"]), 25))
+    # 2. Offer the AI a random subset of the roster for this block (keeps the
+    # prompt small), leaving out artists still in cooldown so the same names
+    # don't repeat every couple of blocks. A roster too small to fill the
+    # cooldown gap just ignores it for this round rather than stalling.
+    cooldown_fraction = config.get('artist_cooldown_fraction', DEFAULT_ARTIST_COOLDOWN_FRACTION)
+    cooldown = artist_cooldown(len(roster['allowed']), cooldown_fraction)
+    history = load_recent_artists(station_id)
+    eligible_artists = filter_by_cooldown(roster['allowed'], history, cooldown)
+    if len(eligible_artists) < song_count:
+        eligible_artists = roster['allowed']
+    artists_pool = random.sample(eligible_artists, min(len(eligible_artists), 25))
 
     # 3. Ask AI to pick best artists and write intro using prompt from config
     try:
@@ -344,6 +399,8 @@ async def run_station(station_id):
         selected_artists = random.sample(artists_pool, min(len(artists_pool), song_count))
         # Use fallback script defined in JSON config, or default English text if missing
         dj_text = config.get('fallback_script', "Coming up next, some great music on our station.")
+
+    save_recent_artists(station_id, history + selected_artists)
 
     # 4. Fetch one random track for each selected artist
     selected_tracks = []

@@ -55,6 +55,26 @@ niche collection (a specific fandom's music, a soundtrack folder, ...): AI
 classification adds no value there, and risks wrongly banning legitimate
 artists it just doesn't recognize.
 
+### Artist cooldown
+
+Each station also keeps a `recent_artists_<station_id>.json` file: a plain
+list of who played, oldest first. Before offering artists to the AI (or to
+the random fallback), `dj_agent.py` drops anyone who played within the last
+`N` songs, where
+
+```
+N = max(1, round(artist_pool_size * artist_cooldown_fraction))
+```
+
+— so a 70-artist roster with the default `artist_cooldown_fraction` of `0.1`
+keeps an artist off the air for at least 7 other songs, while a 10-artist
+one only needs 1. This is deliberately proportional rather than a fixed
+number: a small roster would either repeat constantly under a large fixed
+cooldown or barely be affected by a small one. If the cooldown would leave
+fewer eligible artists than a block needs, it's ignored for that round
+rather than stalling generation. Set `artist_cooldown_fraction` to `0` to
+disable it entirely.
+
 ### Library scanning
 
 `--loop` runs `scanner.py` in the background once at startup, then again
@@ -118,6 +138,7 @@ keyed by station ID:
     "folder_filter": "%/Inna muzyka/%",
     "songs_per_block": 3,
     "use_ai_roster": true,
+    "artist_cooldown_fraction": 0.1,
     "fallback_script": "...",
     "roster_prompt": "... {station_name} ... {description} ... {artists_list} ...",
     "prompt": "... {station_name} ... {description} ... {artists_list} ... {song_count} ..."
@@ -134,6 +155,8 @@ keyed by station ID:
 - `use_ai_roster` — whether to AI-classify artists into allowed/banned (see
   [Artist roster](#artist-roster)) or just allow everything under
   `folder_filter`. Optional, defaults to `true`.
+- `artist_cooldown_fraction` — see [Artist cooldown](#artist-cooldown).
+  Optional, defaults to `0.1`.
 - `roster_prompt` and `prompt` must each produce raw JSON with a
   `selected_indices` field (`prompt` additionally needs `dj_script`); see the
   `ciezki_mlot` entry for the exact contract each is held to. `prompt` can use

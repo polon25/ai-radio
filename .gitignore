@@ -6,5 +6,6 @@ __pycache__/
 *.mp3
 dj_playlist_*.txt
 artists_*.json
+recent_artists_*.json
 dj_agent_*.log
 scanner.lock
