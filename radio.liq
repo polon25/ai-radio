@@ -5,16 +5,14 @@
 # defined in stations.json — just launch another instance with a different
 # STATION_ID.
 #
-# This script only plays whatever is in the station's playlist file; it does
-# not trigger the AI DJ agent itself. That's a deliberate choice: on this
-# deployment's Liquidsoap version, none of the track-boundary callbacks
-# (on_end, on_track, on_metadata) fire reliably in sync with real playback
-# for a playlist() source — testing showed on_end never firing at all when
-# wrapping playlist(), on_track firing instantly for the whole list at load
-# time, and on_metadata firing once with the wrong track's data. Instead,
-# `dj_agent.py <station> --loop` runs as its own long-lived process (start it
-# separately, e.g. via systemd or nohup) and schedules itself from each
-# block's own known duration.
+# This script doesn't pick any music itself. `dj_agent.py <station> --loop`
+# runs as its own long-lived process (start it separately, e.g. via systemd)
+# and, over this script's command socket, pushes each block (DJ intro +
+# songs) onto the "blocks" request queue, and watches how much of it is left
+# to know when to prepare the next one. Queued tracks play exactly once, in
+# order, and a new block never cuts off what's playing. If the queue runs dry
+# (the agent is late or down), tracks from the station's fallback list, also
+# written by dj_agent.py, fill in rather than silence.
 
 project_dir = "./"
 
@@ -39,39 +37,57 @@ if icecast_password == "" then
   print("ERROR: ICECAST_PASSWORD env var is not set (see .env.example).")
 end
 
+# Each station keeps its runtime files in its own stations/<station_id>/
+# folder, so multiple stations can run from the same directory without
+# overwriting each other's files (the paths below must match the get_*_file()
+# helpers in dj_agent.py).
+station_dir = "#{project_dir}stations/#{station_id}"
+
 # Liquidsoap's own log goes to a spool file in the station's log folder, which
 # dj_agent.py forwards into the station's daily log files and empties as it
 # goes (see radio_log.py). It still goes to stdout (journald) as well.
 # Liquidsoap refuses to start if the log folder is missing, so create it first.
-log_dir = "#{project_dir}stations/#{station_id}/logs"
+log_dir = "#{station_dir}/logs"
 system("mkdir -p '#{log_dir}'")
 set("log.file", true)
 set("log.file.path", "#{log_dir}/liquidsoap.spool")
 set("log.stdout", true)
 
-# Each station keeps its runtime files in its own stations/<station_id>/
-# folder, so multiple stations can run from the same directory without
-# overwriting each other's files (must match get_playlist_file() in
-# dj_agent.py).
-playlist_path = "#{project_dir}stations/#{station_id}/playlist.txt"
+# Command server dj_agent.py talks to (see liquidsoap_client.py).
+set("server.socket", true)
+set("server.socket.path", "#{station_dir}/liquidsoap.sock")
 
-# Load playlist in "watch" mode (automatically reloads when the file changes,
-# which is how it picks up each new block written by dj_agent.py --loop).
-# mode="normal" plays it in file order (the DJ intro first, then the songs in
-# the order it announces them); Liquidsoap's default, "randomize", shuffles it.
-playlist_source = playlist(mode="normal", reload_mode="watch", playlist_path)
+# The blocks dj_agent.py queues, played in the order they were pushed.
+blocks = request.equeue(id="blocks")
+
+# Plays only while the block queue is empty. Watched, so it picks up the list
+# as soon as dj_agent.py (re)writes it, even if it didn't exist at startup.
+fallback_tracks = playlist(
+  id="fallback", mode="randomize", reload_mode="watch",
+  "#{station_dir}/fallback.txt"
+)
+
+# track_sensitive: only ever switch between the two at track boundaries.
+radio = fallback(track_sensitive=true, [blocks, fallback_tracks])
 
 # Report every track as it starts playing, with its metadata as JSON, under
 # the "now_playing" label (dj_agent.py turns these into readable "Now
-# playing" lines). Unlike the callbacks described at the top of this file,
-# on_track wrapping the final source does fire in sync with real playback.
+# playing" lines). on_track wrapping the final source fires in sync with real
+# playback (unlike e.g. playlist()'s own on_track parameter, which fires for
+# a whole list as soon as it's loaded).
 def log_now_playing(m) =
   log.important(label="now_playing", json_of(compact=true, m))
 end
 
-# Fallback source to prevent dead air if files are temporarily missing (it
-# shows up in the logs as a track with no filename)
-safe_radio = on_track(log_now_playing, mksafe(playlist_source))
+# mksafe plays silence if there's nothing at all to play (e.g. the fallback
+# list isn't written yet); it shows up in the logs as a track with no filename
+safe_radio = on_track(log_now_playing, mksafe(radio))
+
+# Lets dj_agent.py see how much of the current track is left.
+server.register(
+  usage="remaining", description="Seconds left in the track playing now.",
+  "remaining", fun (_) -> string_of(source.remaining(safe_radio))
+)
 
 # Output stream configuration for Icecast2
 output.icecast(

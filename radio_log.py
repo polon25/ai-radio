@@ -154,13 +154,17 @@ _LIQUIDSOAP_LEVELS = {
     5: logging.DEBUG,
 }
 # Level-3 labels that only repeat what the "now playing" lines already say,
-# or describe Liquidsoap's own startup (library versions, frame sizes, ...).
+# describe Liquidsoap's own startup (library versions, frame sizes, ...), or
+# note every connection dj_agent.py makes to its command socket.
 _LIQUIDSOAP_NOISY_LABELS = {
     "decoder", "main", "frame", "sandbox", "video.converter",
-    "audio.converter", "gstreamer.loader", "dynamic.loader",
+    "audio.converter", "gstreamer.loader", "dynamic.loader", "server",
 }
 # Written by Liquidsoap when it opens its log, i.e. on start.
 _LIQUIDSOAP_START_RE = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) >>> LOG START$")
+# Liquidsoap source id of radio.liq's fallback list, which only plays when the
+# queue of blocks from dj_agent.py has run dry.
+FALLBACK_SOURCE_ID = "fallback"
 # Silence shorter than this isn't reported as dead air: Liquidsoap briefly
 # plays silence on every start, before its first track is ready.
 DEAD_AIR_GRACE_SECONDS = 5
@@ -259,6 +263,13 @@ class LiquidsoapLogForwarder(threading.Thread):
                     created,
                 )
             self.silent_since = None
+        if metadata.get("source") == FALLBACK_SOURCE_ID:
+            self._emit(
+                logging.WARNING,
+                f"Block queue ran dry, playing from the fallback list: {self.describe_track(metadata)}",
+                created,
+            )
+            return
         self._emit(logging.INFO, f"Now playing: {self.describe_track(metadata)}", created, summary=True)
 
     def _check_dead_air(self, now):

@@ -16,17 +16,26 @@ station is just an entry in `stations.json` plus a running pair of processes.
 scanner.py          → indexes a music folder into music_library.db
 dj_agent.py --loop   → repeatedly: picks artists (via AI), fetches one track
                         per artist, writes a DJ intro (AI text → Edge TTS
-                        audio), and writes the station's playlist file
-radio.liq             → plays that playlist file and streams it to Icecast
+                        audio), and queues the block in Liquidsoap
+radio.liq             → plays the queued blocks and streams them to Icecast
 ```
 
-`dj_agent.py` and `radio.liq` run as two independent, long-lived processes
-per station — `dj_agent.py --loop` isn't triggered by Liquidsoap. That's a
-deliberate choice: on the Liquidsoap version this project currently targets
-(1.4.1 — see [Why the Python-side timer](#why-the-python-side-timer) below),
-none of the track-boundary callbacks fire reliably in sync with real
-playback for a `playlist()` source, so `dj_agent.py` instead reads each
-block's own audio duration and schedules its next run from that.
+`dj_agent.py --loop` and `radio.liq` run as two independent, long-lived
+processes per station, talking over Liquidsoap's command socket
+(`stations/<station_id>/liquidsoap.sock`). The agent pushes each block (DJ
+intro + songs) onto Liquidsoap's request queue and polls how much of it is
+left: as soon as the last queued track starts playing — or earlier, if less
+than `BLOCK_LEAD_TIME` seconds of music remain — it prepares the next block
+and queues it behind. Queued tracks play exactly once, in order, and a new
+block never cuts off the current track, however long the AI takes. See
+[Why a request queue](#why-a-request-queue) for why it isn't done with a
+playlist file.
+
+If the queue runs dry anyway (the AI took longer than the last track, or the
+agent is down), `radio.liq` fills in with random tracks from the station's
+fallback list (`fallback.txt`, one track each from up to 50 random roster
+artists, refreshed daily by the agent) rather than going silent. Each such
+track is logged as a warning.
 
 ### Artist roster
 
@@ -83,8 +92,9 @@ Everything a station generates at runtime lives in its own folder,
 
 | File | Contents |
 |---|---|
-| `playlist.txt` | The current block, as read by `radio.liq` |
-| `intro.mp3` | The current block's DJ intro |
+| `intros/` | Generated DJ intros, one per block (the newest few are kept) |
+| `fallback.txt` | Tracks `radio.liq` plays if the block queue runs dry |
+| `liquidsoap.sock` | Liquidsoap's command socket, used by `dj_agent.py` |
 | `artists.json` | The [artist roster](#artist-roster) |
 | `recent_artists.json` | Play history for the [artist cooldown](#artist-cooldown) |
 | `logs/` | The station's [logs](#logs) |
@@ -143,7 +153,7 @@ skip that round.
    | `ICECAST_MOUNT` | Optional; defaults to `/<STATION_ID>` |
    | `OPENROUTER_SITE_URL` | Optional; sent as `HTTP-Referer` to OpenRouter |
    | `OPENROUTER_TIMEOUT` | Optional; seconds before an OpenRouter request is given up on (default 60) |
-   | `BLOCK_LEAD_TIME` | Optional; seconds before a block's natural end that the next one starts generating (default 15) |
+   | `BLOCK_LEAD_TIME` | Optional; the next block is prepared once the last queued track starts, or as soon as less than this many seconds of music are left in the queue (default 120) |
    | `LOG_RETENTION_DAYS` | Optional; days of daily [log files](#logs) to keep (default 7) |
    | `LOG_LEVEL` | Optional; minimum level written to the station logs and stdout (default `INFO`) |
    | `SCAN_INTERVAL_HOURS` | Optional; how often `--loop` rescans the music library in the background, in addition to always scanning once at startup. `0` disables the periodic rescan (default 2) |
@@ -242,25 +252,25 @@ different ID — no new unit files needed. Logs: see [Logs](#logs), or
 3. Run it once manually to build its artist roster and confirm the prompts
    produce sensible output, then enable the two systemd services for it.
 
-## Why the Python-side timer
+## Why a request queue
+
+Earlier versions wrote each block to a playlist file that Liquidsoap
+reloaded, and `dj_agent.py` slept for the block's duration (minus a few
+seconds) before generating the next one. That timer could never line up with
+actual playback: generating a block (AI + TTS) takes anywhere from a few
+seconds to a minute, so the new file usually arrived after the old block had
+ended — Liquidsoap then looped the old block, replaying its intro or first
+song — and since the next timer started when the file was written rather
+than when the block actually started playing, the block after that was
+written minutes early, dropping songs that hadn't played yet.
 
 Liquidsoap 1.4.1 (the version available via `apt` on this deployment's
-Ubuntu release) was tried with three different track-boundary callbacks
-before landing on the current design, in case a future contributor is
-tempted to switch back:
+Ubuntu release) has no callback that reliably fires when a playlist file's
+last track starts: `on_end` never fired when wrapping `playlist()`,
+`playlist()`'s own `on_track` parameter fires for the whole list as soon as
+it's loaded, and `on_metadata` fired once with the wrong track's data. So
+the agent polls instead — Liquidsoap's command server reports the queue's
+contents and the current track's remaining time, which is exact.
 
-- **`on_end`** (fires when remaining time in a track drops below a
-  threshold) never fired at all when wrapping a `playlist()` source in
-  testing, despite working correctly wrapping a `single()` source.
-- **`playlist()`'s own `on_track` parameter** reports `last` (whether the
-  upcoming track is the final one in the list) — but it fires for the whole
-  list within milliseconds of the list loading, not synchronized with actual
-  playback at all.
-- **`on_metadata`** fired once, immediately, with the *last* track's
-  metadata rather than the first — looked like a prefetch/resolution
-  artifact rather than a real playback event.
-
-If this project ever moves to Liquidsoap ≥ 2.0 (not available for this
-deployment's Ubuntu release without building from source or a newer distro),
-`source.on_position`/`remaining_files` reintroduces a reliable version of
-this and the reactive design becomes viable again.
+(`on_track` wrapping the *final* source, on the other hand, does fire in sync
+with real playback, which is what the "Now playing" log lines use.)

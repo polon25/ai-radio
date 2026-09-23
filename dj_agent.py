@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 # which reads its settings from the environment too)
 load_dotenv()
 
+from liquidsoap_client import Liquidsoap
 from radio_log import (
     LIQUIDSOAP_SPOOL_FILE, SUMMARY, LiquidsoapLogForwarder, setup_logging,
 )
@@ -32,11 +33,22 @@ llm_log = logging.getLogger("llm")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://github.com/your-username/your-project")
 OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "60"))
-# In --loop mode, how many seconds before the current block's natural end to
-# start preparing the next one (Liquidsoap has no reliable way to signal
-# "the last track just started" on this deployment's version, so dj_agent.py
-# schedules itself using each block's own known duration instead).
-BLOCK_LEAD_TIME = int(os.getenv("BLOCK_LEAD_TIME", "15"))
+# In --loop mode, the next block is prepared as soon as the last queued track
+# starts playing, or earlier if less than this many seconds of music are left
+# in Liquidsoap's queue (so a short last track doesn't leave too little time
+# for the AI and TTS).
+BLOCK_LEAD_TIME = int(os.getenv("BLOCK_LEAD_TIME", "120"))
+# How often (seconds) --loop checks Liquidsoap's queue, and how long it waits
+# before retrying a block that failed to generate.
+QUEUE_POLL_INTERVAL = 5
+BLOCK_RETRY_DELAY = 15
+# The fallback list radio.liq plays from if the block queue runs dry: this
+# many random tracks from the station's roster, refreshed this often.
+FALLBACK_TRACKS = 50
+FALLBACK_REFRESH_HOURS = 24
+# Generated intros are kept this many at a time (older ones are deleted), so
+# one that's still queued is never overwritten or removed before it plays.
+INTROS_TO_KEEP = 5
 # In --loop mode, how often to re-scan the music library in the background
 # (in addition to always scanning once at startup). 0 disables the periodic
 # rescan (a scan still runs at startup).
@@ -49,11 +61,11 @@ DEFAULT_SONGS_PER_BLOCK = 3
 # repeat, e.g. 0.1 with a 70-artist roster means 7 other songs minimum
 # between two plays of the same artist. 0 disables the cooldown.
 DEFAULT_ARTIST_COOLDOWN_FRACTION = 0.1
-# Every station keeps its own runtime files (playlist, intro audio, roster,
-# play history) in STATIONS_DIR/<station_id>/, so they don't clutter the
-# project root or clash with other stations.
+# Every station keeps its own runtime files (intros, roster, play history,
+# fallback list, logs) in STATIONS_DIR/<station_id>/, so they don't clutter
+# the project root or clash with other stations.
 STATIONS_DIR = "stations"
-INTRO_FILE_NAME = "intro.mp3"
+INTROS_DIR_NAME = "intros"
 
 
 def get_station_dir(station_id):
@@ -64,12 +76,11 @@ def get_station_dir(station_id):
 def ensure_station_dir(station_id):
     """Creates the station's directory and moves over any files left in the
     project root by older versions (which named them <kind>_<station_id>.*),
-    so an upgrade keeps the existing roster and play history."""
+    so an upgrade keeps the existing roster and play history. Playlist and
+    intro files from older versions are no longer used and get deleted."""
     station_dir = get_station_dir(station_id)
-    os.makedirs(station_dir, exist_ok=True)
+    os.makedirs(get_intros_dir(station_id), exist_ok=True)
     legacy_files = {
-        f"dj_playlist_{station_id}.txt": get_playlist_file(station_id),
-        f"dj_intro_{station_id}.mp3": get_intro_audio_file(station_id),
         f"artists_{station_id}.json": get_artists_file(station_id),
         f"recent_artists_{station_id}.json": get_recent_artists_file(station_id),
     }
@@ -77,17 +88,44 @@ def ensure_station_dir(station_id):
         if os.path.exists(old_path) and not os.path.exists(new_path):
             os.replace(old_path, new_path)
             log.info(f"Moved {old_path} -> {new_path}")
+    obsolete_files = [
+        f"dj_playlist_{station_id}.txt",
+        f"dj_intro_{station_id}.mp3",
+        os.path.join(station_dir, "playlist.txt"),
+        os.path.join(station_dir, "intro.mp3"),
+    ]
+    for path in obsolete_files:
+        if os.path.exists(path):
+            os.remove(path)
+            log.info(f"Removed obsolete {path}")
 
 
-def get_playlist_file(station_id):
-    """Path to this station's Liquidsoap playlist file (radio.liq builds the
+def get_intros_dir(station_id):
+    """Directory holding this station's generated DJ intros."""
+    return os.path.join(get_station_dir(station_id), INTROS_DIR_NAME)
+
+
+def new_intro_audio_file(station_id):
+    """Path for a new block's DJ intro. Each block gets its own file: its
+    intro may still be waiting in Liquidsoap's queue while the next block is
+    being generated. Deletes all but the newest INTROS_TO_KEEP intros."""
+    intros_dir = get_intros_dir(station_id)
+    existing = sorted(f for f in os.listdir(intros_dir) if f.endswith(".mp3"))
+    for name in existing[:max(0, len(existing) - INTROS_TO_KEEP + 1)]:
+        os.remove(os.path.join(intros_dir, name))
+    return os.path.join(intros_dir, time.strftime("%Y%m%d-%H%M%S") + ".mp3")
+
+
+def get_socket_file(station_id):
+    """Liquidsoap's command socket for this station (radio.liq builds the
     same path, so keep the two in sync)."""
-    return os.path.join(get_station_dir(station_id), "playlist.txt")
+    return os.path.join(get_station_dir(station_id), "liquidsoap.sock")
 
 
-def get_intro_audio_file(station_id):
-    """Path to this station's generated DJ intro audio file."""
-    return os.path.join(get_station_dir(station_id), INTRO_FILE_NAME)
+def get_fallback_file(station_id):
+    """Tracks radio.liq plays if the block queue runs dry (radio.liq builds
+    the same path, so keep the two in sync)."""
+    return os.path.join(get_station_dir(station_id), "fallback.txt")
 
 
 def get_artists_file(station_id):
@@ -136,7 +174,7 @@ def describe_track(metadata):
     """Human-readable "Artist - Title" for a track's metadata (as reported by
     Liquidsoap), or "DJ intro" for a station's generated intro."""
     path = metadata.get("filename", "")
-    if os.path.basename(path) == INTRO_FILE_NAME:
+    if os.path.basename(os.path.dirname(path)) == INTROS_DIR_NAME:
         return "DJ intro"
     artist, title = metadata.get("artist"), metadata.get("title")
     if artist and title:
@@ -399,36 +437,81 @@ async def generate_audio(text, output_file, voice):
     await communicate.save(output_file)
     ensure_stereo(output_file)
 
-def update_playlist(selected_tracks, dj_audio_file, playlist_file):
-    """Updates the text playlist file for Liquidsoap. Returns the absolute
-    paths written, in play order, for the caller to inspect (e.g. to time
-    the block's total duration)."""
-    files = [os.path.abspath(dj_audio_file)] + [track[0] for track in selected_tracks]
-    with open(playlist_file, "w", encoding="utf-8") as f:
-        for path in files:
-            f.write(f"{path}\n")
-    log.debug(f"Playlist updated successfully in {playlist_file}")
-    return files
+def track_duration(path):
+    """Playback duration of an audio file in seconds, or 0 if it can't be
+    read (e.g. briefly missing/locked) rather than crashing the loop."""
+    try:
+        return MutagenFile(path).info.length
+    except Exception as e:
+        log.warning(f"Could not read duration of {path}: {e}")
+        return 0.0
 
 
 def block_duration(file_paths):
-    """Total playback duration (seconds) of a block, for scheduling the next
-    generation. Files that fail to read (e.g. briefly missing/locked) are
-    skipped rather than crashing the loop."""
-    total = 0.0
-    for path in file_paths:
-        try:
-            total += MutagenFile(path).info.length
-        except Exception as e:
-            log.warning(f"Could not read duration of {path}: {e}")
-    return total
+    """Total playback duration (seconds) of a block."""
+    return sum(track_duration(path) for path in file_paths)
+
+
+def refresh_fallback_list(station_id):
+    """(Re)writes the fallback list radio.liq falls back to when the block
+    queue runs dry, if it's missing or older than FALLBACK_REFRESH_HOURS:
+    one random track each from up to FALLBACK_TRACKS random roster artists,
+    so even a stall stays on-theme instead of going silent."""
+    path = get_fallback_file(station_id)
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < FALLBACK_REFRESH_HOURS * 3600:
+        return
+    artists = load_artist_roster(station_id)["allowed"]
+    if not artists:
+        return  # no roster yet; the first block builds it
+    config = load_station_config(station_id)
+    tracks = []
+    for artist in random.sample(artists, min(len(artists), FALLBACK_TRACKS)):
+        track = get_track_by_artist(artist, config['folder_filter'])
+        if track:
+            tracks.append(track[0])
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.writelines(f"{track}\n" for track in tracks)
+    os.replace(tmp_path, path)  # atomic, so Liquidsoap never reads half a file
+    log.info(f"Refreshed the fallback list: {len(tracks)} track(s)")
+
+
+class QueueState:
+    """What's left in Liquidsoap's block queue: how many tracks are still
+    waiting to play, and roughly how many seconds of music that is,
+    including the rest of the current track."""
+
+    def __init__(self, player, durations):
+        queued = player.queue()
+        on_air = set(player.on_air())
+        pending = [rid for rid in queued if rid not in on_air]
+        seconds = player.remaining()
+        paths = set()
+        for rid in pending:
+            # Keyed by path, not request ID: IDs start over when Liquidsoap
+            # restarts.
+            path = player.metadata(rid).get("filename", "")
+            paths.add(path)
+            if path not in durations:
+                durations[path] = track_duration(path)
+            seconds += durations[path]
+        for path in set(durations) - paths:
+            del durations[path]
+        self.pending_tracks = len(pending)
+        self.seconds_left = seconds
+
+
+def queue_block(player, files):
+    """Pushes a block's files onto Liquidsoap's queue, in play order."""
+    for path in files:
+        player.push(path)
+
 
 async def run_station(station_id):
-    """Generates and writes one block for a station. Returns the list of
-    audio file paths written (intro + songs), or None if it couldn't."""
+    """Generates one block for a station. Returns the absolute paths of its
+    audio files in play order (intro first), or None if it couldn't."""
     config = load_station_config(station_id)
-    playlist_file = get_playlist_file(station_id)
-    dj_audio_file = get_intro_audio_file(station_id)
+    dj_audio_file = new_intro_audio_file(station_id)
     song_count = config.get('songs_per_block', DEFAULT_SONGS_PER_BLOCK)
     use_ai_roster = config.get('use_ai_roster', True)
 
@@ -492,11 +575,22 @@ async def run_station(station_id):
     # don't repeat every couple of blocks. A roster too small to fill the
     # cooldown gap just ignores it for this round rather than stalling.
     cooldown_fraction = config.get('artist_cooldown_fraction', DEFAULT_ARTIST_COOLDOWN_FRACTION)
-    cooldown = artist_cooldown(len(roster['allowed']), cooldown_fraction)
+    # Only artists that are still in the library right now: the roster keeps
+    # every artist ever allowed, including ones whose files have since gone
+    # (or that were added by hand), and those have no track to play.
+    in_library = set(current_artists)
+    playable = [a for a in roster['allowed'] if a in in_library]
+    if len(playable) < len(roster['allowed']):
+        gone = [a for a in roster['allowed'] if a not in in_library]
+        log.info(f"Skipping {len(gone)} roster artist(s) not in the library: {', '.join(gone[:10])}")
+    if not playable:
+        log.error(f"None of the {len(roster['allowed'])} roster artists are in the library. Nothing to play.")
+        return
+    cooldown = artist_cooldown(len(playable), cooldown_fraction)
     history = load_recent_artists(station_id)
-    eligible_artists = filter_by_cooldown(roster['allowed'], history, cooldown)
+    eligible_artists = filter_by_cooldown(playable, history, cooldown)
     if len(eligible_artists) < song_count:
-        eligible_artists = roster['allowed']
+        eligible_artists = playable
     artists_pool = random.sample(eligible_artists, min(len(eligible_artists), 25))
     log.info(
         f"Offering {len(artists_pool)} artist(s) to the AI "
@@ -533,7 +627,7 @@ async def run_station(station_id):
         return
 
     await generate_audio(dj_text, dj_audio_file, config['voice'])
-    files = update_playlist(selected_tracks, dj_audio_file, playlist_file)
+    files = [os.path.abspath(dj_audio_file)] + [track[0] for track in selected_tracks]
     log.info(
         f"Block ready (~{block_duration(files) / 60:.1f} min): intro + "
         + " | ".join(f"{artist} - {title}" for _, artist, title in selected_tracks),
@@ -580,6 +674,53 @@ async def scanner_loop():
         await asyncio.sleep(SCAN_INTERVAL_HOURS * 3600)
 
 
+async def feed_player(station_id):
+    """Keeps Liquidsoap's block queue topped up: whenever the last queued
+    track starts playing (or less than BLOCK_LEAD_TIME seconds of music are
+    left), generates the next block and queues it behind. Queued tracks
+    play exactly once, in order, and never cut off what's playing, however
+    long the AI takes; if it takes longer than what's left, radio.liq bridges
+    the gap with tracks from the fallback list."""
+    player = Liquidsoap(get_socket_file(station_id))
+    loop = asyncio.get_event_loop()
+    durations = {}  # file path -> seconds, cached while the files are queued
+    unreachable_since = None
+
+    while True:
+        try:
+            await loop.run_in_executor(None, refresh_fallback_list, station_id)
+            state = await loop.run_in_executor(None, QueueState, player, durations)
+        except OSError as e:
+            if unreachable_since is None:
+                unreachable_since = time.time()
+                log.warning(f"Can't reach Liquidsoap at {player.socket_path} ({e}); retrying until it's up.")
+            await asyncio.sleep(QUEUE_POLL_INTERVAL)
+            continue
+        if unreachable_since is not None:
+            log.info(f"Liquidsoap is reachable again (after {time.time() - unreachable_since:.0f}s).")
+            unreachable_since = None
+
+        if state.pending_tracks and state.seconds_left >= BLOCK_LEAD_TIME:
+            await asyncio.sleep(QUEUE_POLL_INTERVAL)
+            continue
+
+        log.info(
+            f"{state.pending_tracks} track(s) and ~{state.seconds_left:.0f}s of music left in the queue; "
+            "preparing the next block."
+        )
+        files = await run_station(station_id)
+        if not files:
+            log.error(f"Block generation failed; retrying in {BLOCK_RETRY_DELAY}s.")
+            await asyncio.sleep(BLOCK_RETRY_DELAY)
+            continue
+        try:
+            await loop.run_in_executor(None, queue_block, player, files)
+            log.info(f"Queued the block ({len(files)} files).")
+        except OSError as e:
+            log.error(f"Couldn't queue the block, Liquidsoap unreachable ({e}); it will be regenerated.")
+            await asyncio.sleep(QUEUE_POLL_INTERVAL)
+
+
 async def main():
     args = [a for a in sys.argv[1:] if a != "--loop"]
     loop_mode = "--loop" in sys.argv[1:]
@@ -594,7 +735,14 @@ async def main():
     ensure_station_dir(station_id)
 
     if not loop_mode:
-        await run_station(station_id)
+        # One-shot: generate a single block and queue it if Liquidsoap is up.
+        files = await run_station(station_id)
+        if files:
+            try:
+                queue_block(Liquidsoap(get_socket_file(station_id)), files)
+                log.info("Queued the block.")
+            except OSError as e:
+                log.warning(f"Block generated but not queued, Liquidsoap unreachable: {e}")
         return
 
     log.info("DJ agent started", extra=SUMMARY)
@@ -606,40 +754,10 @@ async def main():
     ).start()
 
     # Scan the library in the background: once now, then periodically. Runs
-    # independently of block generation below, so it never delays playback.
+    # independently of block generation, so it never delays playback.
     asyncio.create_task(scanner_loop())
 
-    # If a playlist file from a previous run is already sitting there (e.g.
-    # this process crashed and got restarted by a supervisor), don't
-    # immediately overwrite it — Liquidsoap may well be mid-way through
-    # playing it. Work out how much of it is probably left and wait that out
-    # first, so a restart never cuts off whatever's currently playing.
-    playlist_file = get_playlist_file(station_id)
-    if os.path.exists(playlist_file):
-        with open(playlist_file, "r", encoding="utf-8") as f:
-            existing_files = [line.strip() for line in f if line.strip()]
-        duration = block_duration(existing_files)
-        elapsed = time.time() - os.path.getmtime(playlist_file)
-        remaining = max(0.0, duration - elapsed - BLOCK_LEAD_TIME)
-        if remaining > 0:
-            log.info(f"Existing block still has ~{remaining:.1f}s left; waiting before generating a new one.")
-            await asyncio.sleep(remaining)
-
-    # Liquidsoap on this deployment has no reliable way to signal "the last
-    # track of the block just started" (see radio.liq), so instead of being
-    # triggered reactively, this process keeps running and schedules its own
-    # next run from each block's actual duration.
-    while True:
-        files = await run_station(station_id)
-        if not files:
-            log.error(f"Block generation failed; retrying in {BLOCK_LEAD_TIME}s.")
-            await asyncio.sleep(BLOCK_LEAD_TIME)
-            continue
-
-        duration = block_duration(files)
-        sleep_time = max(0.0, duration - BLOCK_LEAD_TIME)
-        log.info(f"Block duration ~{duration:.1f}s. Sleeping {sleep_time:.1f}s before preparing the next one.")
-        await asyncio.sleep(sleep_time)
+    await feed_player(station_id)
 
 
 if __name__ == "__main__":
