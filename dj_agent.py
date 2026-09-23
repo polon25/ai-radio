@@ -52,10 +52,11 @@ BLOCK_LEAD_TIME = int(os.getenv("BLOCK_LEAD_TIME", "120"))
 # before retrying a block that failed to generate.
 QUEUE_POLL_INTERVAL = 5
 BLOCK_RETRY_DELAY = 15
-# Edge TTS is an online service: tries, and seconds between them, before a
-# block goes on air without its intro.
-TTS_ATTEMPTS = 3
-TTS_RETRY_DELAY = 5
+# Edge TTS is an online service: seconds to wait before each retry (so one
+# try more than there are delays) before a block goes on air without its
+# intro. Blocks are prepared minutes ahead, so this can ride out a DNS or
+# network hiccup of up to about a minute.
+TTS_RETRY_DELAYS = (5, 15, 30)
 # The fallback list radio.liq plays from if the block queue runs dry: this
 # many random tracks from the station's roster, refreshed this often.
 FALLBACK_TRACKS = 50
@@ -682,16 +683,17 @@ async def generate_audio(text, output_file, voice):
     service), retrying a few times. Returns whether it succeeded, so a
     network hiccup costs the block its intro rather than the whole block."""
     log.info(f"Generating intro with voice '{voice}': {text}")
-    for attempt in range(1, TTS_ATTEMPTS + 1):
+    attempts = len(TTS_RETRY_DELAYS) + 1
+    for attempt in range(1, attempts + 1):
         try:
             communicate = edge_tts.Communicate(text, voice)
             await communicate.save(output_file)
             ensure_stereo(output_file)
             return True
         except Exception as e:
-            log.warning(f"Intro speech synthesis failed (attempt {attempt}/{TTS_ATTEMPTS}): {e!r}")
-            if attempt < TTS_ATTEMPTS:
-                await asyncio.sleep(TTS_RETRY_DELAY)
+            log.warning(f"Intro speech synthesis failed (attempt {attempt}/{attempts}): {e!r}")
+            if attempt < attempts:
+                await asyncio.sleep(TTS_RETRY_DELAYS[attempt - 1])
     log.error("Couldn't synthesize the intro; the block goes on air without it.")
     return False
 
