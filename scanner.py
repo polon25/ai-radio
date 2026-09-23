@@ -25,7 +25,7 @@ SUPPORTED_FORMATS = ('.mp3', '.wav', '.flac', '.ogg')
 # Bump whenever the scanner starts reading something new from the files:
 # tracks scanned by an older version are then read once more to fill it in,
 # while tracks already up to date are skipped without opening the file.
-SCAN_VERSION = 3
+SCAN_VERSION = 4
 # Columns added after the table was first created, as (name, SQL type).
 ADDED_COLUMNS = [
     ("duration", "REAL"),  # seconds; NULL if the file's length can't be read
@@ -61,6 +61,22 @@ def parse_year(date):
     return None
 
 
+# An album folder's year, as in "Artist - Album (2004)" or "Album [1987]".
+FOLDER_YEAR_RE = re.compile(r"[\(\[]((?:1[89]|20)\d\d)[\)\]]")
+
+
+def track_year(filepath, tag_year):
+    """The track's release year: its tag's, unless the album folder's name
+    gives a later one. Tags are sometimes plain wrong (a 2004 album tagged
+    1998), and for stations limited to certain years, counting a track as
+    newer is the safer mistake than letting it pass as older."""
+    match = FOLDER_YEAR_RE.search(os.path.basename(os.path.dirname(filepath)))
+    folder_year = int(match.group(1)) if match else None
+    if folder_year and folder_year > datetime.date.today().year:
+        folder_year = None
+    return max(filter(None, (tag_year, folder_year)), default=None)
+
+
 def read_track(filepath):
     """Reads a file's tags and length. Missing tags fall back to defaults
     (the file name as the title); a missing year or genre is None."""
@@ -79,7 +95,7 @@ def read_track(filepath):
         genre = (audio.get('genre') or [""])[0].strip() or None
         if audio.info is not None and audio.info.length:
             duration = float(audio.info.length)
-    return artist, title, album, duration, year, genre
+    return artist, title, album, duration, track_year(filepath, year), genre
 
 
 def scan_folder(conn):

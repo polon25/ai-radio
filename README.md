@@ -136,7 +136,8 @@ that block.
 ### Release years and genres
 
 The scanner stores each track's release year (the `originaldate` or `date`
-tag) and genre (the `genre` tag, which is often vague or plain wrong, so
+tag, or the year in the album folder's name — `Album (2004)`, `Album [2004]` —
+if that's later, since tags are sometimes plain wrong) and genre (the `genre` tag, which is often vague or plain wrong, so
 it's only used as a hint). On a station with `years`, the agent asks the AI
 — in the background, after each library scan — for the original release
 year and genre of its roster's tracks that have none in their tags; each
