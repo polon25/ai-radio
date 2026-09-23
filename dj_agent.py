@@ -748,7 +748,7 @@ class QueueState:
         for rid in pending:
             # Keyed by path, not request ID: IDs start over when Liquidsoap
             # restarts.
-            path = player.metadata(rid).get("filename", "")
+            path = player.request_path(rid)
             paths.add(path)
             if path not in durations:
                 durations[path] = track_duration(path)

@@ -5,10 +5,14 @@ the command's output followed by an "END" line, and closes the connection
 after "quit".
 """
 
+import re
 import socket
 
 # Must match the request.equeue id in radio.liq.
 QUEUE_ID = "blocks"
+# "annotate:key="value",...:<path>", as push() builds it (the server may
+# report the quotes backslash-escaped)
+ANNOTATE_RE = re.compile(r'^annotate:(?:[^=:,]+=\\?"[^"]*?\\?",?)*:(.*)$')
 
 
 class Liquidsoap:
@@ -58,6 +62,17 @@ class Liquidsoap:
         lines = self.command("remaining")
         seconds = float(lines[0]) if lines else 0.0
         return seconds if 0.0 <= seconds < float("inf") else 0.0
+
+    def request_path(self, rid):
+        """The file a queued request plays. Before Liquidsoap has prepared a
+        request its metadata has no "filename" yet, only the URI it was
+        pushed with (possibly wrapped in annotate:...)."""
+        metadata = self.metadata(rid)
+        if metadata.get("filename"):
+            return metadata["filename"]
+        uri = metadata.get("initial_uri", "")
+        match = ANNOTATE_RE.match(uri)
+        return match.group(1) if match else uri
 
     def metadata(self, rid):
         """A request's metadata as a dict (e.g. its "filename")."""
