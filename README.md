@@ -156,7 +156,9 @@ Fifteen minutes before, the agent
    a few more than `count`, most important first, leaving out
    stories covered in the last `avoid_repeat_hours` bulletins unless the
    headlines show something new (a story that does come back is written as
-   an update, focusing on what's new),
+   an update, focusing on what's new). Articles already read out in those
+   bulletins (same link or headline) are removed from the list beforehand,
+   since weaker models don't always follow that instruction,
 3. fetches those articles' text (for sites that block it, e.g. the New York
    Times, the feed's summary is used instead) and keeps the `count` most
    important stories whose full article it got, as a summary alone can't

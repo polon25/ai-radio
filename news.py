@@ -216,6 +216,23 @@ def fetch_article_text(url):
     return text[:MAX_ARTICLE_CHARS]
 
 
+def _normalized(text):
+    return " ".join(re.sub(r"[^\w\s]", " ", (text or "").lower()).split())
+
+
+def _drop_aired(headlines, recent):
+    """Leaves out headlines of articles already read in recent bulletins
+    (same link or same headline): the AI is also told not to repeat them,
+    but weaker models don't always listen. Other articles about the same
+    events stay, for the AI to judge whether there's anything new."""
+    aired_links = {r.get("link") for r in recent if r.get("link")}
+    aired_titles = {_normalized(r.get("headline")) for r in recent if r.get("headline")}
+    kept = [h for h in headlines if h["link"] not in aired_links and _normalized(h["title"]) not in aired_titles]
+    if len(kept) < len(headlines):
+        log.info(f"Left out {len(headlines) - len(kept)} headline(s) of articles already aired recently.")
+    return kept
+
+
 def _recent_listing(recent):
     return "\n".join(f"- {r.get('topic', '')}: {r.get('headline', '')}" for r in recent)
 
@@ -228,7 +245,7 @@ def _pick_stories(headlines, settings, ask_json, recent):
         f"{i}. [{h['source']}] {h['title']}" + (f" — {h['summary'][:200]}" if h["summary"] else "")
         for i, h in enumerate(headlines, 1)
     )
-    count = settings["count"] + EXTRA_STORIES
+    count = min(settings["count"] + EXTRA_STORIES, len(headlines))
     prompt = (
         f"You are the news editor of a radio station. Below are the current headlines from several news "
         f"sites' front pages (some entries are ads, links to the sites' services or teasers, not news). "
@@ -350,6 +367,7 @@ def build_stories(settings, language, ask_json, recent=()):
     headlines = fetch_headlines(settings["sources"])
     if not headlines:
         raise ValueError("No headlines from any news source.")
+    headlines = _drop_aired(headlines, recent)
     candidates = _pick_stories(headlines, settings, ask_json, recent)
     for story in candidates:
         story["text"] = fetch_article_text(story["link"])
@@ -360,6 +378,7 @@ def build_stories(settings, language, ask_json, recent=()):
     # Remember what each item was about, for the next bulletins' `recent`.
     for item, story in zip(items, picked):
         item["headline"] = story["title"]
+        item["link"] = story["link"]
     return items
 
 
