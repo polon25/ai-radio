@@ -56,8 +56,10 @@ set("log.stdout", true)
 playlist_path = "#{project_dir}stations/#{station_id}/playlist.txt"
 
 # Load playlist in "watch" mode (automatically reloads when the file changes,
-# which is how it picks up each new block written by dj_agent.py --loop)
-playlist_source = playlist(reload_mode="watch", playlist_path)
+# which is how it picks up each new block written by dj_agent.py --loop).
+# mode="normal" plays it in file order (the DJ intro first, then the songs in
+# the order it announces them); Liquidsoap's default, "randomize", shuffles it.
+playlist_source = playlist(mode="normal", reload_mode="watch", playlist_path)
 
 # Report every track as it starts playing, with its metadata as JSON, under
 # the "now_playing" label (dj_agent.py turns these into readable "Now
