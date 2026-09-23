@@ -128,9 +128,10 @@ wait in the spool until it is.
 
 `--loop` runs `scanner.py` in the background once at startup, then again
 every `SCAN_INTERVAL_HOURS` (default 2). If several stations' `--loop`
-processes are running against the same `music_library.db`, a `scanner.lock`
-file makes sure only one of them actually scans at a time — the rest just
-skip that round.
+processes are running against the same `music_library.db`, a lock on
+`scanner.lock` makes sure only one scan (theirs or a manual one) runs at a
+time — the rest just skip that round. The lock is released automatically
+when the scan's process ends, even if it's killed, so it can't go stale.
 
 ## Setup
 

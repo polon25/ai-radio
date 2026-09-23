@@ -1,3 +1,4 @@
+import fcntl
 import logging
 import os
 import sqlite3
@@ -14,6 +15,10 @@ log = logging.getLogger("scanner")
 # Configuration
 MUSIC_FOLDER = os.getenv("MUSIC_FOLDER", "./music")
 DB_FILE = "music_library.db"
+# Held (flock) for the duration of a scan, so several stations' agents, or a
+# manual run, never scan at once. The OS releases it when the process ends,
+# however it ends, so a killed scan can't leave a stale lock behind.
+LOCK_FILE = "scanner.lock"
 SUPPORTED_FORMATS = ('.mp3', '.wav', '.flac', '.ogg')
 
 def create_database():
@@ -65,6 +70,12 @@ def scan_folder(conn):
 
 if __name__ == "__main__":
     setup_logging()
-    db_conn = create_database()
-    scan_folder(db_conn)
-    db_conn.close()
+    with open(LOCK_FILE, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log.info("A library scan is already in progress (elsewhere); skipping this one.")
+            raise SystemExit(0)
+        db_conn = create_database()
+        scan_folder(db_conn)
+        db_conn.close()

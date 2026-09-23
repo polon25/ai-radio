@@ -60,7 +60,6 @@ INTROS_TO_KEEP = 5
 SCAN_INTERVAL_HOURS = float(os.getenv("SCAN_INTERVAL_HOURS", "2"))
 DB_FILE = "music_library.db"
 CONFIG_FILE = "stations.json"
-SCAN_LOCK_FILE = "scanner.lock"
 DEFAULT_SONGS_PER_BLOCK = 3
 # Fraction of a station's artist pool that must play before an artist can
 # repeat, e.g. 0.1 with a 70-artist roster means 7 other songs minimum
@@ -669,28 +668,12 @@ async def run_station(station_id):
 
 def run_scanner_once():
     """Runs scanner.py to (re)index the music library. Several stations may
-    each run their own --loop process against the same music_library.db, so
-    a lock file makes sure only one scan runs at a time — the others just
-    skip that round rather than racing each other."""
-    if os.path.exists(SCAN_LOCK_FILE):
-        age = time.time() - os.path.getmtime(SCAN_LOCK_FILE)
-        if age < 3600:
-            log.info("A library scan is already in progress (elsewhere); skipping this round.")
-            return
-        log.warning("Found a stale scan lock; a previous scan may have crashed. Proceeding anyway.")
-
-    with open(SCAN_LOCK_FILE, "w") as f:
-        f.write(str(os.getpid()))
-    try:
-        log.info("Scanning music library in the background...")
-        result = subprocess.run([sys.executable, "scanner.py"], check=False)
-        if result.returncode != 0:
-            log.error(f"scanner.py exited with code {result.returncode}")
-    finally:
-        try:
-            os.remove(SCAN_LOCK_FILE)
-        except FileNotFoundError:
-            pass
+    each run their own --loop process against the same music_library.db;
+    scanner.py itself makes sure only one scan runs at a time."""
+    log.info("Scanning music library in the background...")
+    result = subprocess.run([sys.executable, "scanner.py"], check=False)
+    if result.returncode != 0:
+        log.error(f"scanner.py exited with code {result.returncode}")
 
 
 async def scanner_loop():
