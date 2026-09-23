@@ -40,24 +40,51 @@ DEFAULT_SONGS_PER_BLOCK = 3
 # repeat, e.g. 0.1 with a 70-artist roster means 7 other songs minimum
 # between two plays of the same artist. 0 disables the cooldown.
 DEFAULT_ARTIST_COOLDOWN_FRACTION = 0.1
+# Every station keeps its own runtime files (playlist, intro audio, roster,
+# play history) in STATIONS_DIR/<station_id>/, so they don't clutter the
+# project root or clash with other stations.
+STATIONS_DIR = "stations"
+
+
+def get_station_dir(station_id):
+    """Directory holding all of this station's runtime files."""
+    return os.path.join(STATIONS_DIR, station_id)
+
+
+def ensure_station_dir(station_id):
+    """Creates the station's directory and moves over any files left in the
+    project root by older versions (which named them <kind>_<station_id>.*),
+    so an upgrade keeps the existing roster and play history."""
+    station_dir = get_station_dir(station_id)
+    os.makedirs(station_dir, exist_ok=True)
+    legacy_files = {
+        f"dj_playlist_{station_id}.txt": get_playlist_file(station_id),
+        f"dj_intro_{station_id}.mp3": get_intro_audio_file(station_id),
+        f"artists_{station_id}.json": get_artists_file(station_id),
+        f"recent_artists_{station_id}.json": get_recent_artists_file(station_id),
+    }
+    for old_path, new_path in legacy_files.items():
+        if os.path.exists(old_path) and not os.path.exists(new_path):
+            os.replace(old_path, new_path)
+            print(f"Moved {old_path} -> {new_path}")
 
 
 def get_playlist_file(station_id):
-    """Path to this station's Liquidsoap playlist file (one per station, so
-    multiple stations can share this directory without clashing)."""
-    return f"dj_playlist_{station_id}.txt"
+    """Path to this station's Liquidsoap playlist file (radio.liq builds the
+    same path, so keep the two in sync)."""
+    return os.path.join(get_station_dir(station_id), "playlist.txt")
 
 
 def get_intro_audio_file(station_id):
     """Path to this station's generated DJ intro audio file."""
-    return f"dj_intro_{station_id}.mp3"
+    return os.path.join(get_station_dir(station_id), "intro.mp3")
 
 
 def get_artists_file(station_id):
     """Path to this station's artist roster: which artists are allowed to be
     played, and which are banned (manually, or because the AI already ruled
     them out as off-theme, so they aren't re-asked about every run)."""
-    return f"artists_{station_id}.json"
+    return os.path.join(get_station_dir(station_id), "artists.json")
 
 
 def load_artist_roster(station_id):
@@ -92,7 +119,7 @@ def save_artist_roster(station_id, roster):
 def get_recent_artists_file(station_id):
     """Path to this station's recently-played-artists history, used to
     enforce the artist cooldown."""
-    return f"recent_artists_{station_id}.json"
+    return os.path.join(get_station_dir(station_id), "recent_artists.json")
 
 
 def load_recent_artists(station_id):
@@ -460,6 +487,8 @@ async def main():
         return
 
     station_id = args[0]
+    load_station_config(station_id)  # fail fast on an unknown station ID
+    ensure_station_dir(station_id)
 
     if not loop_mode:
         await run_station(station_id)

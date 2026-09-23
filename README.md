@@ -30,7 +30,8 @@ block's own audio duration and schedules its next run from that.
 
 ### Artist roster
 
-Each station keeps an `artists_<station_id>.json` file:
+Each station keeps an `artists.json` file in its runtime folder (see
+[Station files](#station-files)):
 
 ```json
 {
@@ -57,7 +58,7 @@ artists it just doesn't recognize.
 
 ### Artist cooldown
 
-Each station also keeps a `recent_artists_<station_id>.json` file: a plain
+Each station also keeps a `recent_artists.json` file: a plain
 list of who played, oldest first. Before offering artists to the AI (or to
 the random fallback), `dj_agent.py` drops anyone who played within the last
 `N` songs, where
@@ -74,6 +75,23 @@ cooldown or barely be affected by a small one. If the cooldown would leave
 fewer eligible artists than a block needs, it's ignored for that round
 rather than stalling generation. Set `artist_cooldown_fraction` to `0` to
 disable it entirely.
+
+### Station files
+
+Everything a station generates at runtime lives in its own folder,
+`stations/<station_id>/` (created automatically, gitignored):
+
+| File | Contents |
+|---|---|
+| `playlist.txt` | The current block, as read by `radio.liq` |
+| `intro.mp3` | The current block's DJ intro |
+| `artists.json` | The [artist roster](#artist-roster) |
+| `recent_artists.json` | Play history for the [artist cooldown](#artist-cooldown) |
+
+Shared files (`stations.json`, `music_library.db`, `.env`) stay in the
+project root. Files left in the project root by older versions
+(`artists_<station_id>.json` etc.) are moved into the station's folder
+automatically the next time `dj_agent.py` starts for that station.
 
 ### Library scanning
 

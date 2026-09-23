@@ -4,8 +4,6 @@ venv/
 __pycache__/
 *.db
 *.mp3
-dj_playlist_*.txt
-artists_*.json
-recent_artists_*.json
+stations/
 dj_agent_*.log
 scanner.lock

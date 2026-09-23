@@ -39,9 +39,11 @@ if icecast_password == "" then
   print("ERROR: ICECAST_PASSWORD env var is not set (see .env.example).")
 end
 
-# Each station gets its own playlist file, so multiple stations can run from
-# the same directory without overwriting each other's files.
-playlist_path = "#{project_dir}dj_playlist_#{station_id}.txt"
+# Each station keeps its runtime files in its own stations/<station_id>/
+# folder, so multiple stations can run from the same directory without
+# overwriting each other's files (must match get_playlist_file() in
+# dj_agent.py).
+playlist_path = "#{project_dir}stations/#{station_id}/playlist.txt"
 
 # Load playlist in "watch" mode (automatically reloads when the file changes,
 # which is how it picks up each new block written by dj_agent.py --loop)
