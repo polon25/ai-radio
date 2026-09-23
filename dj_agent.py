@@ -47,6 +47,10 @@ BLOCK_LEAD_TIME = int(os.getenv("BLOCK_LEAD_TIME", "120"))
 # before retrying a block that failed to generate.
 QUEUE_POLL_INTERVAL = 5
 BLOCK_RETRY_DELAY = 15
+# Edge TTS is an online service: tries, and seconds between them, before a
+# block goes on air without its intro.
+TTS_ATTEMPTS = 3
+TTS_RETRY_DELAY = 5
 # The fallback list radio.liq plays from if the block queue runs dry: this
 # many random tracks from the station's roster, refreshed this often.
 FALLBACK_TRACKS = 50
@@ -471,11 +475,22 @@ def ensure_stereo(path):
 
 
 async def generate_audio(text, output_file, voice):
-    """Converts the generated text to speech using Edge TTS."""
+    """Converts the generated text to speech using Edge TTS (an online
+    service), retrying a few times. Returns whether it succeeded, so a
+    network hiccup costs the block its intro rather than the whole block."""
     log.info(f"Generating intro with voice '{voice}': {text}")
-    communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_file)
-    ensure_stereo(output_file)
+    for attempt in range(1, TTS_ATTEMPTS + 1):
+        try:
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(output_file)
+            ensure_stereo(output_file)
+            return True
+        except Exception as e:
+            log.warning(f"Intro speech synthesis failed (attempt {attempt}/{TTS_ATTEMPTS}): {e!r}")
+            if attempt < TTS_ATTEMPTS:
+                await asyncio.sleep(TTS_RETRY_DELAY)
+    log.error("Couldn't synthesize the intro; the block goes on air without it.")
+    return False
 
 def track_duration(path):
     """Playback duration of an audio file in seconds, or 0 if it can't be
@@ -663,10 +678,10 @@ async def run_station(station_id):
         log.error("Could not retrieve tracks for selected artists.")
         return
 
-    await generate_audio(dj_text, dj_audio_file, config['voice'])
-    files = [os.path.abspath(dj_audio_file)] + [track[0] for track in selected_tracks]
+    intro = [os.path.abspath(dj_audio_file)] if await generate_audio(dj_text, dj_audio_file, config['voice']) else []
+    files = intro + [track[0] for track in selected_tracks]
     log.info(
-        f"Block ready (~{block_duration(files) / 60:.1f} min): intro + "
+        f"Block ready (~{block_duration(files) / 60:.1f} min): {'intro + ' if intro else 'no intro, '}"
         + " | ".join(f"{artist} - {title}" for _, artist, title in selected_tracks),
         extra=SUMMARY,
     )
@@ -729,7 +744,13 @@ async def feed_player(station_id):
             f"{state.pending_tracks} track(s) and ~{state.seconds_left:.0f}s of music left in the queue; "
             "preparing the next block."
         )
-        files = await run_station(station_id)
+        try:
+            files = await run_station(station_id)
+        except Exception:
+            # Anything unexpected (a library or network error...) shouldn't
+            # take the whole agent down; Liquidsoap keeps playing meanwhile.
+            log.exception("Unexpected error while preparing a block")
+            files = None
         if not files:
             log.error(f"Block generation failed; retrying in {BLOCK_RETRY_DELAY}s.")
             await asyncio.sleep(BLOCK_RETRY_DELAY)
