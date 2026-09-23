@@ -34,6 +34,9 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://github.com/your-username/your-project")
 # Seconds a whole OpenRouter request (including reading the answer) may take.
 OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "60"))
+# The same for background work nothing on air waits for (classifying
+# artists, filling in track info): long lists take slow models a while.
+OPENROUTER_BACKGROUND_TIMEOUT = int(os.getenv("OPENROUTER_BACKGROUND_TIMEOUT", "180"))
 # "openrouter/free" routes each request to some free model, which now and
 # then is one that can't follow the prompt (e.g. a content-safety classifier
 # answering "User Safety: safe"), so unusable answers are retried.
@@ -389,7 +392,7 @@ def _shorten(text, limit=500):
     return text if len(text) <= limit else text[:limit] + f"... ({len(text)} chars)"
 
 
-def call_openrouter_json(prompt, purpose):
+def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT):
     """Sends a prompt to OpenRouter and parses the response as JSON. The
     prompt must instruct the model to reply with raw JSON. `purpose` only
     labels the request in the logs. Every failure is logged (under the "llm"
@@ -417,19 +420,19 @@ def call_openrouter_json(prompt, purpose):
         # requests' timeout only limits the wait for each next chunk, and
         # OpenRouter keeps sending whitespace while a model is still working,
         # so a slow model could hold a request for many minutes. Read the
-        # body as it arrives and enforce OPENROUTER_TIMEOUT on the total.
+        # body as it arrives and enforce `timeout` on the total.
         with requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers=headers,
             json=payload,
-            timeout=OPENROUTER_TIMEOUT,
+            timeout=timeout,
             stream=True,
         ) as response:
             chunks = []
             for chunk in response.iter_content(chunk_size=8192):
                 chunks.append(chunk)
-                if time.monotonic() - started > OPENROUTER_TIMEOUT:
-                    raise requests.Timeout(f"no complete answer within {OPENROUTER_TIMEOUT}s")
+                if time.monotonic() - started > timeout:
+                    raise requests.Timeout(f"no complete answer within {timeout}s")
             body = b"".join(chunks).decode("utf-8", "replace")
     except requests.RequestException as e:
         llm_log.warning(f"Request ({purpose}) failed after {time.monotonic() - started:.1f}s: {e}")
@@ -481,14 +484,14 @@ def call_openrouter_json(prompt, purpose):
     return parsed
 
 
-def ask_llm_json(prompt, purpose, validate):
+def ask_llm_json(prompt, purpose, validate, timeout=OPENROUTER_TIMEOUT):
     """call_openrouter_json(), retried up to OPENROUTER_ATTEMPTS times until
     `validate(parsed)` accepts the answer (it raises ValueError/KeyError on
     an unusable one) and returns what the caller needs from it. Raises the
     last error if every attempt fails."""
     for attempt in range(1, OPENROUTER_ATTEMPTS + 1):
         try:
-            return validate(call_openrouter_json(prompt, purpose))
+            return validate(call_openrouter_json(prompt, purpose, timeout))
         except (requests.RequestException, ValueError, KeyError) as e:
             if attempt == OPENROUTER_ATTEMPTS:
                 raise
@@ -588,7 +591,7 @@ def classify_artists(candidates, config):
             return pick_by_indices(parsed_data["selected_indices"], batch, "roster")
 
         try:
-            batch_fitting = ask_llm_json(prompt, "roster", validate)
+            batch_fitting = ask_llm_json(prompt, "roster", validate, OPENROUTER_BACKGROUND_TIMEOUT)
         except Exception as e:
             log.warning(f"Couldn't classify {len(batch)} artist(s) ({e}); they'll be retried next time.")
             continue
@@ -601,12 +604,13 @@ def classify_artists(candidates, config):
     return fitting, non_fitting
 
 
-def update_roster(station_id, config, current_artists, rebuild=False):
+def update_roster(station_id, config, current_artists, rebuild=False, classify=True):
     """Loads this station's artist roster (allowed + banned) and brings it
     up to date with the library, saving any change. Every artist ever seen
     ends up in either "allowed" or "banned", so only new ones get classified
     and this stays cheap once the roster has caught up. rebuild=True
-    classifies every artist from scratch instead.
+    classifies every artist from scratch instead; classify=False skips
+    classifying (for callers that can't wait for the AI).
 
     Some stations don't want AI curation at all (use_ai_roster=false), e.g.
     a folder that's already a dedicated, niche collection, where AI filtering
@@ -622,7 +626,7 @@ def update_roster(station_id, config, current_artists, rebuild=False):
 
     known = set(roster["allowed"]) | set(roster["banned"])
     new_artists = [a for a in current_artists if a not in known]
-    if not new_artists:
+    if not new_artists or not classify:
         return roster
     if known:
         log.info(f"Found {len(new_artists)} new artist(s) in the library. Checking if they fit '{config['name']}'...")
@@ -747,15 +751,17 @@ async def run_station(station_id):
     dj_audio_file = new_intro_audio_file(station_id)
     song_count = config.get('songs_per_block', DEFAULT_SONGS_PER_BLOCK)
 
-    # 1. Bring this station's artist roster up to date with the library.
+    # 1. Load this station's artist roster. New artists get classified in
+    # the background after each library scan (see scanner_loop), so a slow
+    # AI never holds up a block.
     current_artists = get_all_artists(config)
     if not current_artists:
         log.error(f"No artists found matching filter: {config['folder_filter']}!")
         return
-    roster = update_roster(station_id, config, current_artists)
+    roster = update_roster(station_id, config, current_artists, classify=False)
     if not roster["allowed"] and not roster["banned"]:
-        # The AI couldn't classify anything yet (e.g. it's down); play from
-        # the whole library this time, without saving that as the roster.
+        # Not classified yet (a new station, or the AI is down); play from
+        # the whole library meanwhile, without saving that as the roster.
         log.warning("No artist roster yet; using every artist in the library for this block.")
         roster = {"allowed": current_artists, "banned": []}
 
@@ -907,7 +913,7 @@ def fill_missing_track_info(station_id):
             return answers
 
         try:
-            answers = ask_llm_json(prompt, "track info", validate)
+            answers = ask_llm_json(prompt, "track info", validate, OPENROUTER_BACKGROUND_TIMEOUT)
         except Exception as e:
             log.warning(f"Couldn't get track info for {len(batch)} track(s) ({e}); will retry next time.")
             continue
@@ -935,16 +941,25 @@ def run_scanner_once():
         log.error(f"scanner.py exited with code {result.returncode}")
 
 
+def refresh_roster(station_id):
+    """Classifies artists that are new in the library (or, for a new
+    station, builds its roster)."""
+    config = load_station_config(station_id)
+    update_roster(station_id, config, get_all_artists(config))
+
+
 async def scanner_loop(station_id):
     """Scans once immediately, then every SCAN_INTERVAL_HOURS (if > 0), each
-    time followed by filling in missing track info the station needs."""
+    time followed by classifying new artists into the station's roster and
+    filling in missing track info the station needs."""
     loop = asyncio.get_event_loop()
     while True:
         await loop.run_in_executor(None, run_scanner_once)
-        try:
-            await loop.run_in_executor(None, fill_missing_track_info, station_id)
-        except Exception:
-            log.exception("Failed to fill in missing track info")
+        for task in (refresh_roster, fill_missing_track_info):
+            try:
+                await loop.run_in_executor(None, task, station_id)
+            except Exception:
+                log.exception(f"Background task {task.__name__} failed")
         if SCAN_INTERVAL_HOURS <= 0:
             return
         await asyncio.sleep(SCAN_INTERVAL_HOURS * 3600)

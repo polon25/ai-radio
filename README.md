@@ -49,11 +49,14 @@ Each station keeps an `artists.json` file in its runtime folder (see
 }
 ```
 
-On first run (or whenever the file is missing/empty), `dj_agent.py` asks the
-AI to classify every artist in the library against the station's theme —
-`fitting` goes to `allowed`, everything else to `banned`. Every later run
-scans the library for artists it hasn't seen yet and classifies only those,
-so this stays cheap once the roster has caught up with the library.
+After each library scan (see [Library scanning](#library-scanning)),
+`dj_agent.py --loop` asks the AI to classify the artists it hasn't seen yet
+against the station's theme — `fitting` goes to `allowed`, everything else
+to `banned`. The first time (or whenever the file is missing/empty) that's
+every artist in the library; after that only new ones, so this stays cheap
+once the roster has caught up. It happens in the background, so a slow AI
+never holds up a block; a station with no roster yet plays from its whole
+library until it's built.
 
 Artists are classified 40 per request (with hundreds in one numbered list,
 models lose track of the numbers and pick huge swathes of off-theme
@@ -209,7 +212,8 @@ lengths, years, genres), so rescans stay cheap.
    | `ICECAST_HOST` / `ICECAST_PORT` | Icecast server connection |
    | `ICECAST_MOUNT` | Optional; defaults to `/<STATION_ID>` |
    | `OPENROUTER_SITE_URL` | Optional; sent as `HTTP-Referer` to OpenRouter |
-   | `OPENROUTER_TIMEOUT` | Optional; seconds before an OpenRouter request is given up on (default 60) |
+   | `OPENROUTER_TIMEOUT` | Optional; seconds a whole OpenRouter request for a block (artist picks + DJ script) may take before it's given up on (default 60) |
+   | `OPENROUTER_BACKGROUND_TIMEOUT` | Optional; the same for background work nothing on air waits for — classifying artists, filling in track info (default 180) |
    | `OPENROUTER_MODEL` | Optional; OpenRouter model to use (default `openrouter/free`, which picks some free model per request) |
    | `OPENROUTER_ATTEMPTS` | Optional; how many times a request whose answer is unusable (not JSON, missing fields, no valid artists) is tried before falling back to a random pick and the station's `fallback_script` (default 3) |
    | `BLOCK_LEAD_TIME` | Optional; the next block is prepared once the last queued track starts, or as soon as less than this many seconds of music are left in the queue (default 120) |
