@@ -87,11 +87,32 @@ Everything a station generates at runtime lives in its own folder,
 | `intro.mp3` | The current block's DJ intro |
 | `artists.json` | The [artist roster](#artist-roster) |
 | `recent_artists.json` | Play history for the [artist cooldown](#artist-cooldown) |
+| `logs/` | The station's [logs](#logs) |
 
 Shared files (`stations.json`, `music_library.db`, `.env`) stay in the
 project root. Files left in the project root by older versions
 (`artists_<station_id>.json` etc.) are moved into the station's folder
 automatically the next time `dj_agent.py` starts for that station.
+
+### Logs
+
+Every process logs to stdout (so `journalctl` still works) and to daily log
+files, one file per day, deleted after `LOG_RETENTION_DAYS` (default 7):
+
+| Where | What |
+|---|---|
+| `stations/<station_id>/logs/YYYY-MM-DD.log` | Everything about one station: block preparation, which artists/tracks were picked and the DJ script, every LLM request (which model answered, how long it took, errors, malformed answers), what Liquidsoap actually started playing ("Now playing"), and Liquidsoap's own messages |
+| `logs/YYYY-MM-DD.log` | The overview: warnings and errors from every station and the scanner, plus each station's key events (blocks prepared, "Now playing") |
+
+Each line reads `time level [station] component: message`, so e.g.
+`grep -h "Now playing" stations/*/logs/$(date +%F).log` shows what every
+station has played today.
+
+Liquidsoap can't write into these files directly, so `radio.liq` logs to a
+`liquidsoap.spool` file in the station's log folder, which that station's
+`dj_agent.py --loop` forwards into its log (keeping Liquidsoap's timestamps)
+and then empties. If the agent isn't running, Liquidsoap's messages simply
+wait in the spool until it is.
 
 ### Library scanning
 
@@ -123,6 +144,8 @@ skip that round.
    | `OPENROUTER_SITE_URL` | Optional; sent as `HTTP-Referer` to OpenRouter |
    | `OPENROUTER_TIMEOUT` | Optional; seconds before an OpenRouter request is given up on (default 60) |
    | `BLOCK_LEAD_TIME` | Optional; seconds before a block's natural end that the next one starts generating (default 15) |
+   | `LOG_RETENTION_DAYS` | Optional; days of daily [log files](#logs) to keep (default 7) |
+   | `LOG_LEVEL` | Optional; minimum level written to the station logs and stdout (default `INFO`) |
    | `SCAN_INTERVAL_HOURS` | Optional; how often `--loop` rescans the music library in the background, in addition to always scanning once at startup. `0` disables the periodic rescan (default 2) |
 
 3. **Stations** — copy `stations.json.example` to `stations.json` and edit it
@@ -209,7 +232,8 @@ sudo systemctl enable --now radio-agent@ciezki_mlot.service
 ```
 
 Adding another station later is just another `enable --now` pair with a
-different ID — no new unit files needed. Logs: `journalctl -u radio-agent@ciezki_mlot -f`.
+different ID — no new unit files needed. Logs: see [Logs](#logs), or
+`journalctl -u radio-agent@ciezki_mlot -f`.
 
 ## Adding a new station
 

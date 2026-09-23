@@ -2,6 +2,7 @@ import sqlite3
 import os
 import sys
 import json
+import logging
 import random
 import subprocess
 import time
@@ -12,13 +13,21 @@ import imageio_ffmpeg
 from mutagen import File as MutagenFile
 from dotenv import load_dotenv
 
-# Force line-buffered stdout so `print()` shows up promptly in a log file
+# Load environment variables from .env file (before importing radio_log,
+# which reads its settings from the environment too)
+load_dotenv()
+
+from radio_log import (
+    LIQUIDSOAP_SPOOL_FILE, SUMMARY, LiquidsoapLogForwarder, setup_logging,
+)
+
+# Force line-buffered stdout so log lines show up promptly in journald
 # even when running unattended (e.g. as a long-lived --loop process), not
 # just when attached to a terminal.
 sys.stdout.reconfigure(line_buffering=True)
 
-# Load environment variables from .env file
-load_dotenv()
+log = logging.getLogger("agent")
+llm_log = logging.getLogger("llm")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://github.com/your-username/your-project")
@@ -44,6 +53,7 @@ DEFAULT_ARTIST_COOLDOWN_FRACTION = 0.1
 # play history) in STATIONS_DIR/<station_id>/, so they don't clutter the
 # project root or clash with other stations.
 STATIONS_DIR = "stations"
+INTRO_FILE_NAME = "intro.mp3"
 
 
 def get_station_dir(station_id):
@@ -66,7 +76,7 @@ def ensure_station_dir(station_id):
     for old_path, new_path in legacy_files.items():
         if os.path.exists(old_path) and not os.path.exists(new_path):
             os.replace(old_path, new_path)
-            print(f"Moved {old_path} -> {new_path}")
+            log.info(f"Moved {old_path} -> {new_path}")
 
 
 def get_playlist_file(station_id):
@@ -77,7 +87,7 @@ def get_playlist_file(station_id):
 
 def get_intro_audio_file(station_id):
     """Path to this station's generated DJ intro audio file."""
-    return os.path.join(get_station_dir(station_id), "intro.mp3")
+    return os.path.join(get_station_dir(station_id), INTRO_FILE_NAME)
 
 
 def get_artists_file(station_id):
@@ -110,10 +120,28 @@ def save_artist_roster(station_id, roster):
     path = get_artists_file(station_id)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(roster, f, ensure_ascii=False, indent=2)
-    print(
+    log.info(
         f"Saved roster to {path}: {len(roster['allowed'])} allowed, "
         f"{len(roster['banned'])} banned"
     )
+
+
+def get_log_dir(station_id):
+    """Directory holding this station's daily log files (and the spool file
+    radio.liq writes Liquidsoap's log to, see radio_log.py)."""
+    return os.path.join(get_station_dir(station_id), "logs")
+
+
+def describe_track(metadata):
+    """Human-readable "Artist - Title" for a track's metadata (as reported by
+    Liquidsoap), or "DJ intro" for a station's generated intro."""
+    path = metadata.get("filename", "")
+    if os.path.basename(path) == INTRO_FILE_NAME:
+        return "DJ intro"
+    artist, title = metadata.get("artist"), metadata.get("title")
+    if artist and title:
+        return f"{artist} - {title}"
+    return os.path.basename(path) or "(unknown)"
 
 
 def get_recent_artists_file(station_id):
@@ -210,9 +238,17 @@ def format_artist_list(artists):
     return "\n".join([f"{i+1}. {artist}" for i, artist in enumerate(artists)])
 
 
-def call_openrouter_json(prompt):
+def _shorten(text, limit=500):
+    """Trims long API payloads so a single bad response can't flood the log."""
+    text = str(text)
+    return text if len(text) <= limit else text[:limit] + f"... ({len(text)} chars)"
+
+
+def call_openrouter_json(prompt, purpose):
     """Sends a prompt to OpenRouter and parses the response as JSON. The
-    prompt must instruct the model to reply with raw JSON."""
+    prompt must instruct the model to reply with raw JSON. `purpose` only
+    labels the request in the logs. Every failure is logged (under the "llm"
+    component) before being raised."""
     if not OPENROUTER_API_KEY:
         raise ValueError("OPENROUTER_API_KEY is missing. Check your .env file.")
 
@@ -230,26 +266,48 @@ def call_openrouter_json(prompt):
         ]
     }
 
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=OPENROUTER_TIMEOUT,
-    )
+    llm_log.info(f"Request ({purpose}), model {payload['model']}, prompt {len(prompt)} chars")
+    started = time.monotonic()
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=OPENROUTER_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        llm_log.warning(f"Request ({purpose}) failed after {time.monotonic() - started:.1f}s: {e}")
+        raise
+    elapsed = time.monotonic() - started
 
     try:
         result = response.json()
     except Exception as e:
+        llm_log.warning(
+            f"Response ({purpose}) is not JSON: HTTP {response.status_code} after {elapsed:.1f}s: "
+            f"{_shorten(response.text)}"
+        )
         raise ValueError(f"Failed to parse API response. Status: {response.status_code}, Text: {response.text}")
 
     # Check if the response contains the expected 'choices' key
     if 'choices' not in result:
-        print("\n--- OPENROUTER API ERROR ---")
-        print(json.dumps(result, indent=2))
-        print("----------------------------\n")
+        llm_log.warning(
+            f"API error ({purpose}): HTTP {response.status_code} after {elapsed:.1f}s: "
+            f"{_shorten(json.dumps(result.get('error', result), ensure_ascii=False))}"
+        )
         raise KeyError("OpenRouter did not return 'choices'.")
 
-    raw_content = result['choices'][0]['message']['content'].strip()
+    model = result.get("model", "?")
+    usage = result.get("usage") or {}
+    llm_log.info(
+        f"Response ({purpose}) from {model} in {elapsed:.1f}s "
+        f"(tokens: {usage.get('prompt_tokens', '?')} in, {usage.get('completion_tokens', '?')} out)"
+    )
+
+    raw_content = (result['choices'][0]['message'].get('content') or "").strip()
+    if not raw_content:
+        llm_log.warning(f"Empty response ({purpose}) from {model}")
+        raise ValueError(f"{model} returned an empty response.")
 
     # Clean potential markdown code blocks if the model wrapped the JSON anyway
     if raw_content.startswith("```json"):
@@ -258,7 +316,31 @@ def call_openrouter_json(prompt):
         raw_content = raw_content[:-3]
     raw_content = raw_content.strip()
 
-    return json.loads(raw_content)
+    try:
+        return json.loads(raw_content)
+    except json.JSONDecodeError as e:
+        llm_log.warning(f"Invalid JSON ({purpose}) from {model}: {e}: {_shorten(raw_content)}")
+        raise
+
+
+def pick_by_indices(indices, candidates, purpose):
+    """Maps the 1-based `selected_indices` an AI returned onto `candidates`,
+    logging (and skipping) any that are malformed, out of range or repeated."""
+    if not isinstance(indices, list):
+        llm_log.warning(f"'selected_indices' ({purpose}) is not a list: {_shorten(indices)}")
+        return []
+    picked, invalid = [], []
+    for i in indices:
+        if isinstance(i, int) and 0 < i <= len(candidates) and candidates[i - 1] not in picked:
+            picked.append(candidates[i - 1])
+        else:
+            invalid.append(i)
+    if invalid:
+        llm_log.warning(
+            f"Ignored {len(invalid)} invalid/duplicate index(es) ({purpose}) "
+            f"out of 1..{len(candidates)}: {_shorten(invalid, 200)}"
+        )
+    return picked
 
 
 def curate_artists_and_script(artists, prompt_template, station_name, description, song_count):
@@ -270,9 +352,15 @@ def curate_artists_and_script(artists, prompt_template, station_name, descriptio
         description=description,
         song_count=song_count,
     )
-    print("Asking AI to curate artists and write the script...")
-    parsed_data = call_openrouter_json(prompt)
-    return parsed_data["selected_indices"], parsed_data["dj_script"]
+    log.info("Asking AI to curate artists and write the script...")
+    parsed_data = call_openrouter_json(prompt, "curation")
+    if "dj_script" not in parsed_data or "selected_indices" not in parsed_data:
+        llm_log.warning(f"Curation response is missing fields: {_shorten(json.dumps(parsed_data, ensure_ascii=False))}")
+        raise KeyError("AI response lacks 'selected_indices' or 'dj_script'.")
+    selected = pick_by_indices(parsed_data["selected_indices"], artists, "curation")
+    if len(selected) != song_count:
+        llm_log.warning(f"Asked for {song_count} artist(s), AI picked {len(selected)} valid one(s)")
+    return selected[:song_count], parsed_data["dj_script"]
 
 
 def classify_artists(candidates, prompt_template, station_name, description):
@@ -284,10 +372,9 @@ def classify_artists(candidates, prompt_template, station_name, description):
         station_name=station_name,
         description=description,
     )
-    print(f"Asking AI to classify {len(candidates)} artist(s) against the station's theme...")
-    parsed_data = call_openrouter_json(prompt)
-    indices = parsed_data["selected_indices"]
-    fitting = [candidates[i - 1] for i in indices if 0 < i <= len(candidates)]
+    log.info(f"Asking AI to classify {len(candidates)} artist(s) against the station's theme...")
+    parsed_data = call_openrouter_json(prompt, "roster")
+    fitting = pick_by_indices(parsed_data.get("selected_indices"), candidates, "roster")
     non_fitting = [a for a in candidates if a not in fitting]
     return fitting, non_fitting
 
@@ -307,7 +394,7 @@ def ensure_stereo(path):
 
 async def generate_audio(text, output_file, voice):
     """Converts the generated text to speech using Edge TTS."""
-    print(f"Generating audio with voice '{voice}': {text}")
+    log.info(f"Generating intro with voice '{voice}': {text}")
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(output_file)
     ensure_stereo(output_file)
@@ -320,7 +407,7 @@ def update_playlist(selected_tracks, dj_audio_file, playlist_file):
     with open(playlist_file, "w", encoding="utf-8") as f:
         for path in files:
             f.write(f"{path}\n")
-    print(f"Playlist updated successfully in {playlist_file}")
+    log.debug(f"Playlist updated successfully in {playlist_file}")
     return files
 
 
@@ -333,7 +420,7 @@ def block_duration(file_paths):
         try:
             total += MutagenFile(path).info.length
         except Exception as e:
-            print(f"Warning: could not read duration of {path}: {e}")
+            log.warning(f"Could not read duration of {path}: {e}")
     return total
 
 async def run_station(station_id):
@@ -358,9 +445,9 @@ async def run_station(station_id):
             roster["allowed"], roster["banned"] = current_artists, []
             save_artist_roster(station_id, roster)
     elif not roster["allowed"] and not roster["banned"]:
-        print(f"No artist roster found for '{station_id}'. Building one from the whole library...")
+        log.info(f"No artist roster found for '{station_id}'. Building one from the whole library...")
         if not current_artists:
-            print(f"No artists found matching filter: {config['folder_filter']}!")
+            log.error(f"No artists found matching filter: {config['folder_filter']}!")
             return
         try:
             fitting, non_fitting = classify_artists(
@@ -370,7 +457,7 @@ async def run_station(station_id):
                 raise ValueError("AI did not select any artists for the roster.")
             roster["allowed"], roster["banned"] = fitting, non_fitting
         except Exception as e:
-            print(f"Error building artist roster: {e}. Using the full candidate pool instead.")
+            log.warning(f"Error building artist roster: {e}. Using the full candidate pool instead.")
             roster["allowed"] = current_artists
         save_artist_roster(station_id, roster)
     else:
@@ -381,7 +468,7 @@ async def run_station(station_id):
         known = set(roster["allowed"]) | set(roster["banned"])
         new_artists = [a for a in current_artists if a not in known]
         if new_artists:
-            print(f"Found {len(new_artists)} new artist(s) in the library. Checking if they fit '{config['name']}'...")
+            log.info(f"Found {len(new_artists)} new artist(s) in the library. Checking if they fit '{config['name']}'...")
             try:
                 fitting, non_fitting = classify_artists(
                     new_artists, config['roster_prompt'], config['name'], config['description']
@@ -390,15 +477,15 @@ async def run_station(station_id):
                 roster["banned"].extend(non_fitting)
                 save_artist_roster(station_id, roster)
                 if fitting:
-                    print(f"Added to roster: {', '.join(fitting)}")
+                    log.info(f"Added to roster: {', '.join(fitting)}")
             except Exception as e:
-                print(f"Error classifying new artists: {e}. Will retry next run.")
+                log.warning(f"Error classifying new artists: {e}. Will retry next run.")
 
     if not roster["allowed"]:
-        print(f"Artist roster for '{station_id}' is empty. Nothing to play.")
+        log.error(f"Artist roster for '{station_id}' is empty. Nothing to play.")
         return
 
-    print(f"--- Starting artist curation for station: {station_id} ({len(roster['allowed'])} artists in roster) ---")
+    log.info(f"Preparing a new block ({len(roster['allowed'])} artists in roster)")
 
     # 2. Offer the AI a random subset of the roster for this block (keeps the
     # prompt small), leaving out artists still in cooldown so the same names
@@ -411,18 +498,21 @@ async def run_station(station_id):
     if len(eligible_artists) < song_count:
         eligible_artists = roster['allowed']
     artists_pool = random.sample(eligible_artists, min(len(eligible_artists), 25))
+    log.info(
+        f"Offering {len(artists_pool)} artist(s) to the AI "
+        f"({len(eligible_artists)} eligible, cooldown {cooldown} song(s))"
+    )
 
     # 3. Ask AI to pick best artists and write intro using prompt from config
     try:
-        indices, dj_text = curate_artists_and_script(
+        selected_artists, dj_text = curate_artists_and_script(
             artists_pool, config['prompt'], config['name'], config['description'], song_count
         )
-        selected_artists = [artists_pool[i - 1] for i in indices if 0 < i <= len(artists_pool)]
 
         if len(selected_artists) == 0:
             raise ValueError("AI did not select any valid artists.")
     except Exception as e:
-        print(f"Error during AI curation: {e}. Falling back to random selection.")
+        log.warning(f"Error during AI curation: {e}. Falling back to random selection and the fallback script.")
         selected_artists = random.sample(artists_pool, min(len(artists_pool), song_count))
         # Use fallback script defined in JSON config, or default English text if missing
         dj_text = config.get('fallback_script', "Coming up next, some great music on our station.")
@@ -435,13 +525,23 @@ async def run_station(station_id):
         track = get_track_by_artist(artist, config['folder_filter'])
         if track:
             selected_tracks.append(track)
+        else:
+            log.warning(f"No track found in the library for artist '{artist}'")
 
     if not selected_tracks:
-        print("Error: Could not retrieve tracks for selected artists.")
+        log.error("Could not retrieve tracks for selected artists.")
         return
 
     await generate_audio(dj_text, dj_audio_file, config['voice'])
-    return update_playlist(selected_tracks, dj_audio_file, playlist_file)
+    files = update_playlist(selected_tracks, dj_audio_file, playlist_file)
+    log.info(
+        f"Block ready (~{block_duration(files) / 60:.1f} min): intro + "
+        + " | ".join(f"{artist} - {title}" for _, artist, title in selected_tracks),
+        extra=SUMMARY,
+    )
+    for i, (path, artist, title) in enumerate(selected_tracks, 1):
+        log.info(f"  {i}. {artist} - {title} [{path}]")
+    return files
 
 
 def run_scanner_once():
@@ -452,15 +552,17 @@ def run_scanner_once():
     if os.path.exists(SCAN_LOCK_FILE):
         age = time.time() - os.path.getmtime(SCAN_LOCK_FILE)
         if age < 3600:
-            print("A library scan is already in progress (elsewhere); skipping this round.")
+            log.info("A library scan is already in progress (elsewhere); skipping this round.")
             return
-        print("Found a stale scan lock; a previous scan may have crashed. Proceeding anyway.")
+        log.warning("Found a stale scan lock; a previous scan may have crashed. Proceeding anyway.")
 
     with open(SCAN_LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
     try:
-        print("Scanning music library in the background...")
-        subprocess.run([sys.executable, "scanner.py"], check=False)
+        log.info("Scanning music library in the background...")
+        result = subprocess.run([sys.executable, "scanner.py"], check=False)
+        if result.returncode != 0:
+            log.error(f"scanner.py exited with code {result.returncode}")
     finally:
         try:
             os.remove(SCAN_LOCK_FILE)
@@ -488,11 +590,20 @@ async def main():
 
     station_id = args[0]
     load_station_config(station_id)  # fail fast on an unknown station ID
+    setup_logging(station_id, get_log_dir(station_id))
     ensure_station_dir(station_id)
 
     if not loop_mode:
         await run_station(station_id)
         return
+
+    log.info("DJ agent started", extra=SUMMARY)
+
+    # Forward Liquidsoap's log (radio.liq writes it to a spool file in the
+    # station's log folder) into this station's logs.
+    LiquidsoapLogForwarder(
+        os.path.join(get_log_dir(station_id), LIQUIDSOAP_SPOOL_FILE), describe_track
+    ).start()
 
     # Scan the library in the background: once now, then periodically. Runs
     # independently of block generation below, so it never delays playback.
@@ -511,7 +622,7 @@ async def main():
         elapsed = time.time() - os.path.getmtime(playlist_file)
         remaining = max(0.0, duration - elapsed - BLOCK_LEAD_TIME)
         if remaining > 0:
-            print(f"Existing block still has ~{remaining:.1f}s left; waiting before generating a new one.")
+            log.info(f"Existing block still has ~{remaining:.1f}s left; waiting before generating a new one.")
             await asyncio.sleep(remaining)
 
     # Liquidsoap on this deployment has no reliable way to signal "the last
@@ -521,15 +632,23 @@ async def main():
     while True:
         files = await run_station(station_id)
         if not files:
-            print(f"Block generation failed for '{station_id}'; retrying in {BLOCK_LEAD_TIME}s.")
+            log.error(f"Block generation failed; retrying in {BLOCK_LEAD_TIME}s.")
             await asyncio.sleep(BLOCK_LEAD_TIME)
             continue
 
         duration = block_duration(files)
         sleep_time = max(0.0, duration - BLOCK_LEAD_TIME)
-        print(f"Block duration ~{duration:.1f}s. Sleeping {sleep_time:.1f}s before preparing the next one.")
+        log.info(f"Block duration ~{duration:.1f}s. Sleeping {sleep_time:.1f}s before preparing the next one.")
         await asyncio.sleep(sleep_time)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        # Record the crash in the log files too, not just on stderr, before
+        # letting it take the process down (systemd restarts it).
+        log.exception("DJ agent crashed")
+        raise

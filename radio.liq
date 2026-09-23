@@ -39,6 +39,16 @@ if icecast_password == "" then
   print("ERROR: ICECAST_PASSWORD env var is not set (see .env.example).")
 end
 
+# Liquidsoap's own log goes to a spool file in the station's log folder, which
+# dj_agent.py forwards into the station's daily log files and empties as it
+# goes (see radio_log.py). It still goes to stdout (journald) as well.
+# Liquidsoap refuses to start if the log folder is missing, so create it first.
+log_dir = "#{project_dir}stations/#{station_id}/logs"
+system("mkdir -p '#{log_dir}'")
+set("log.file", true)
+set("log.file.path", "#{log_dir}/liquidsoap.spool")
+set("log.stdout", true)
+
 # Each station keeps its runtime files in its own stations/<station_id>/
 # folder, so multiple stations can run from the same directory without
 # overwriting each other's files (must match get_playlist_file() in
@@ -49,8 +59,17 @@ playlist_path = "#{project_dir}stations/#{station_id}/playlist.txt"
 # which is how it picks up each new block written by dj_agent.py --loop)
 playlist_source = playlist(reload_mode="watch", playlist_path)
 
-# Fallback source to prevent dead air if files are temporarily missing
-safe_radio = mksafe(playlist_source)
+# Report every track as it starts playing, with its metadata as JSON, under
+# the "now_playing" label (dj_agent.py turns these into readable "Now
+# playing" lines). Unlike the callbacks described at the top of this file,
+# on_track wrapping the final source does fire in sync with real playback.
+def log_now_playing(m) =
+  log.important(label="now_playing", json_of(compact=true, m))
+end
+
+# Fallback source to prevent dead air if files are temporarily missing (it
+# shows up in the logs as a track with no filename)
+safe_radio = on_track(log_now_playing, mksafe(playlist_source))
 
 # Output stream configuration for Icecast2
 output.icecast(
