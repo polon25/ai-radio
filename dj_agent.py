@@ -113,9 +113,12 @@ NEWS_DIR_NAME = "news"
 # News stories shared by all stations with the same news settings, one file
 # per hour, so the AI writes them once (project root; gitignored).
 NEWS_CACHE_DIR = "news_cache"
-# A news segment is prepared this long before the top of the hour it airs at,
-# and dropped if it's still not ready this long after it.
+# A news segment is prepared this long before the top of the hour it's for,
+# queued this long before it (it then plays as soon as the current track
+# ends, i.e. around the top of the hour), and dropped if it's still not ready
+# this long after it.
 NEWS_PREPARE_MINUTES = 15
+NEWS_QUEUE_MINUTES = 2
 NEWS_MAX_LATE_MINUTES = 10
 
 
@@ -1052,17 +1055,22 @@ async def prepare_news_segment(station_id, config, settings, hour):
 
 
 def queue_news(player, path, config, settings):
-    """Puts a news segment on air: radio.liq fades out the current track,
-    plays the segment, then carries on with the next track."""
+    """Queues a news segment: radio.liq plays it as soon as the current
+    track ends, then carries on with the next track."""
     player.push(path, {"artist": config['name'], "title": settings['title']}, queue=NEWS_QUEUE_ID)
-    log.info(f"News on air ({track_duration(path) / 60:.1f} min).", extra=SUMMARY)
+    log.info(
+        f"News queued ({track_duration(path) / 60:.1f} min); it starts when the current track ends, "
+        f"in ~{player.remaining():.0f}s.",
+        extra=SUMMARY,
+    )
 
 
 async def news_loop(station_id):
     """For a station with news sources (see news.news_settings), prepares a
-    news segment NEWS_PREPARE_MINUTES before every full hour and puts it on
-    air on the hour. Re-reads the station's settings every time, so news can
-    be switched on or off without a restart."""
+    news segment NEWS_PREPARE_MINUTES before every full hour and queues it
+    NEWS_QUEUE_MINUTES before, so it plays at the first track boundary from
+    then on. Re-reads the station's settings every time, so news can be
+    switched on or off without a restart."""
     player = Liquidsoap(get_socket_file(station_id))
     while True:
         now = datetime.datetime.now()
@@ -1075,7 +1083,8 @@ async def news_loop(station_id):
             config = load_station_config(station_id)
             settings = news.news_settings(config)
             path = settings and await prepare_news_segment(station_id, config, settings, next_hour)
-            await asyncio.sleep(max(0.0, (next_hour - datetime.datetime.now()).total_seconds()))
+            queue_at = next_hour - datetime.timedelta(minutes=NEWS_QUEUE_MINUTES)
+            await asyncio.sleep(max(0.0, (queue_at - datetime.datetime.now()).total_seconds()))
             late = (datetime.datetime.now() - next_hour).total_seconds() / 60
             if path and late > NEWS_MAX_LATE_MINUTES:
                 log.warning(f"The {next_hour:%H:%M} news was ready {late:.0f} min late; skipping it.")
@@ -1209,7 +1218,8 @@ async def main():
         return
 
     if "--news-now" in sys.argv[1:]:
-        # Prepare this hour's news segment and put it on air right away.
+        # Prepare this hour's news segment and queue it right away (it plays
+        # when the current track ends).
         config = load_station_config(station_id)
         settings = news.news_settings(config)
         if not settings:

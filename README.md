@@ -166,12 +166,16 @@ Fifteen minutes before, the agent
 5. wraps them in the station's `intro` and `outro` and turns the text into
    speech.
 
-On the hour, `radio.liq` fades out whatever is playing, plays the news, and
-carries on with the next track. A segment still not ready 10 minutes past
-the hour is dropped. Stations with the same news settings share
+Two minutes before the hour the segment is queued, and `radio.liq` plays it
+as soon as the current track ends — so it starts around the top of the hour,
+between a couple of minutes early and one track late — then carries on with
+the next track. (Cutting into the current track isn't reliable on Liquidsoap
+1.4: skipping a source that isn't playing, or one inside a `fallback`,
+either doesn't skip it or skips a track too many.) A segment still not ready
+10 minutes past the hour is dropped. Stations with the same news settings share
 each hour's stories (written once, cached in `news_cache/`), so only the
 station's name in the intro and its voice differ. `dj_agent.py <station_id>
---news-now` prepares a segment and puts it on air immediately, e.g. to try
+--news-now` prepares a segment and queues it right away, e.g. to try
 the settings out. See [Configuring a station](#configuring-a-station) for
 the settings.
 

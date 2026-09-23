@@ -12,9 +12,9 @@
 # to know when to prepare the next one. Queued tracks play exactly once, in
 # order, and a new block never cuts off what's playing. If the queue runs dry
 # (the agent is late or down), tracks from the station's fallback list, also
-# written by dj_agent.py, fill in rather than silence. On the hour, stations
-# with news sources get a news segment on the "news" queue, which fades out
-# whatever is playing (see below).
+# written by dj_agent.py, fill in rather than silence. Around the top of the
+# hour, stations with news sources get a news segment on the "news" queue,
+# which plays as soon as the current track ends.
 
 project_dir = "./"
 
@@ -96,26 +96,13 @@ def log_now_playing(m) =
   current_title := list.filter(fun (kv) -> fst(kv) == "artist" or fst(kv) == "title", m)
 end
 
-# News segments dj_agent.py pushes on the hour. Unlike the music they don't
-# wait for the current track to end: the track fades out, the news plays, and
-# the music carries on with the next track (the faded-out one is skipped).
-news_queue = request.equeue(id="news")
-# Sets the stream's title; assigned below, once the final source exists.
-set_stream_title = ref(fun (_) -> ())
-def news_started(m) =
-  source.skip(music)
-  # The transition into the news hides the news' own metadata from
-  # everything downstream, so report it (and set the title) from here.
-  log_now_playing(m)
-  set_title = !set_stream_title
-  set_title(!current_title)
-end
-news = on_track(news_started, news_queue)
-def fade_out_music(old, new) = sequence([fade.final(duration=3., old), new]) end
-def fade_in_music(old, new) = fade.initial(duration=2., new) end
-radio = fallback(
-  track_sensitive=false, transitions=[fade_out_music, fade_in_music], [news, music]
-)
+# News segments dj_agent.py pushes shortly before the top of the hour. They
+# play as soon as the current track ends, then the music carries on with its
+# next track. (Cutting into a track instead isn't reliable on this Liquidsoap
+# version: skipping a source that isn't playing, or one inside a fallback,
+# either doesn't skip it or skips a track too many.)
+news = request.equeue(id="news")
+radio = fallback(track_sensitive=true, [news, music])
 
 # mksafe plays silence if there's nothing at all to play (e.g. the fallback
 # list isn't written yet); it shows up in the logs as a track with no filename
@@ -126,7 +113,6 @@ safe_radio = on_track(log_now_playing, mksafe(radio))
 # track. On every (re)connection, re-insert the current track's artist/title.
 with_title = insert_metadata(safe_radio)
 insert_title = fst(with_title)
-set_stream_title := fun (title) -> insert_title(new_track=false, title)
 def resend_title() =
   if !current_title != [] then insert_title(new_track=false, !current_title) end
 end
