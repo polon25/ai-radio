@@ -9,6 +9,9 @@ import time
 import requests
 import asyncio
 import collections
+import datetime
+import fcntl
+import hashlib
 import edge_tts
 import imageio_ffmpeg
 from mutagen import File as MutagenFile
@@ -18,7 +21,8 @@ from dotenv import load_dotenv
 # which reads its settings from the environment too)
 load_dotenv()
 
-from liquidsoap_client import Liquidsoap
+import news
+from liquidsoap_client import NEWS_QUEUE_ID, Liquidsoap
 from radio_log import (
     LIQUIDSOAP_SPOOL_FILE, SUMMARY, LiquidsoapLogForwarder, setup_logging,
 )
@@ -104,6 +108,13 @@ ROSTER_VOTES = 3
 # the project root or clash with other stations.
 STATIONS_DIR = "stations"
 INTROS_DIR_NAME = "intros"
+# Each station's generated news segments (see news.py), in its own folder.
+NEWS_DIR_NAME = "news"
+# News stories shared by all stations with the same news settings, one file
+# per hour, so the AI writes them once (project root; gitignored).
+NEWS_CACHE_DIR = "news_cache"
+# A news segment is prepared this long before the top of the hour it airs at.
+NEWS_PREPARE_MINUTES = 10
 
 
 def get_station_dir(station_id):
@@ -214,8 +225,11 @@ def describe_track(metadata):
     """Human-readable "Artist - Title" for a track's metadata (as reported by
     Liquidsoap), or "DJ intro" for a station's generated intro."""
     path = metadata.get("filename", "")
-    if os.path.basename(os.path.dirname(path)) == INTROS_DIR_NAME:
+    folder = os.path.basename(os.path.dirname(path))
+    if folder == INTROS_DIR_NAME:
         return "DJ intro"
+    if folder == NEWS_DIR_NAME:
+        return "News"
     artist, title = metadata.get("artist"), metadata.get("title")
     if artist and title:
         return f"{artist} - {title}"
@@ -350,9 +364,9 @@ def init_play_history():
 
 def record_play(station_id, metadata, played_at):
     """Records that a track started playing on the station (called for every
-    "now playing" Liquidsoap reports; DJ intros aren't recorded)."""
+    "now playing" Liquidsoap reports; DJ intros and news aren't recorded)."""
     path = metadata.get("filename", "")
-    if not path or os.path.basename(os.path.dirname(path)) == INTROS_DIR_NAME:
+    if not path or os.path.basename(os.path.dirname(path)) in (INTROS_DIR_NAME, NEWS_DIR_NAME):
         return
     conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.execute("INSERT INTO plays (station, filepath, played_at) VALUES (?, ?, ?)", (station_id, path, played_at))
@@ -399,10 +413,11 @@ def _shorten(text, limit=500):
     return text if len(text) <= limit else text[:limit] + f"... ({len(text)} chars)"
 
 
-def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT):
+def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT, model=None):
     """Sends a prompt to OpenRouter and parses the response as JSON. The
     prompt must instruct the model to reply with raw JSON. `purpose` only
-    labels the request in the logs. Every failure is logged (under the "llm"
+    labels the request in the logs. `model` asks for a specific model, with
+    OpenRouter falling back to OPENROUTER_MODEL if it's unavailable. Every failure is logged (under the "llm"
     component) before being raised."""
     if not OPENROUTER_API_KEY:
         raise ValueError("OPENROUTER_API_KEY is missing. Check your .env file.")
@@ -414,13 +429,15 @@ def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT):
     }
 
     payload = {
-        "model": OPENROUTER_MODEL,
+        "model": model or OPENROUTER_MODEL,
         "messages": [
             {"role": "system", "content": "You are a precise radio automation agent. You always output valid raw JSON."},
             {"role": "user", "content": prompt}
         ]
     }
 
+    if model and model != OPENROUTER_MODEL:
+        payload["models"] = [model, OPENROUTER_MODEL]
     llm_log.info(f"Request ({purpose}), model {payload['model']}, prompt {len(prompt)} chars")
     started = time.monotonic()
     try:
@@ -491,14 +508,14 @@ def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT):
     return parsed
 
 
-def ask_llm_json(prompt, purpose, validate, timeout=OPENROUTER_TIMEOUT):
+def ask_llm_json(prompt, purpose, validate, timeout=OPENROUTER_TIMEOUT, model=None):
     """call_openrouter_json(), retried up to OPENROUTER_ATTEMPTS times until
     `validate(parsed)` accepts the answer (it raises ValueError/KeyError on
     an unusable one) and returns what the caller needs from it. Raises the
     last error if every attempt fails."""
     for attempt in range(1, OPENROUTER_ATTEMPTS + 1):
         try:
-            return validate(call_openrouter_json(prompt, purpose, timeout))
+            return validate(call_openrouter_json(prompt, purpose, timeout, model))
         except (requests.RequestException, ValueError, KeyError) as e:
             if attempt == OPENROUTER_ATTEMPTS:
                 raise
@@ -960,6 +977,103 @@ def fill_missing_track_info(station_id):
         log.info(f"AI filled in the release year of {filled} of {len(rows)} track(s).")
 
 
+def station_language(config):
+    """The locale of the station's TTS voice, e.g. "pl-PL" for
+    "pl-PL-MarekNeural"; tells the AI which language to write news in."""
+    return "-".join(config['voice'].split("-")[:2])
+
+
+def get_news_stories(settings, language, hour):
+    """This hour's news stories for these settings. The first station to
+    ask has the AI write them (see news.build_stories) while holding a lock;
+    stations with the same settings then reuse them from NEWS_CACHE_DIR."""
+    os.makedirs(NEWS_CACHE_DIR, exist_ok=True)
+    digest = hashlib.sha1(news.cache_key(settings, language).encode("utf-8")).hexdigest()[:12]
+    base = os.path.join(NEWS_CACHE_DIR, f"{hour:%Y%m%d-%H}-{digest}")
+    with open(base + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(base + ".json"):
+            log.info("Using this hour's news stories already written for another station.")
+            with open(base + ".json", encoding="utf-8") as f:
+                return json.load(f)
+
+        def ask_json(prompt, purpose, validate):
+            return ask_llm_json(prompt, purpose, validate, OPENROUTER_BACKGROUND_TIMEOUT, settings.get("model"))
+
+        stories = news.build_stories(settings, language, ask_json)
+        with open(base + ".json.tmp", "w", encoding="utf-8") as f:
+            json.dump(stories, f, ensure_ascii=False, indent=1)
+        os.replace(base + ".json.tmp", base + ".json")
+    # Drop other hours' stories (and locks) older than a day.
+    for name in os.listdir(NEWS_CACHE_DIR):
+        path = os.path.join(NEWS_CACHE_DIR, name)
+        if time.time() - os.path.getmtime(path) > 86400:
+            os.remove(path)
+    return stories
+
+
+async def prepare_news_segment(station_id, config, settings, hour):
+    """Writes and synthesizes the news segment for `hour` (a datetime on the
+    hour). Returns the audio file's path, or None if it couldn't be made."""
+    loop = asyncio.get_event_loop()
+    try:
+        stories = await loop.run_in_executor(
+            None, get_news_stories, settings, station_language(config), hour
+        )
+    except Exception as e:
+        log.error(f"Couldn't prepare the {hour:%H:%M} news: {e}")
+        return None
+    script = news.assemble_script(stories, settings, config['name'], hour.hour)
+    log.info(f"News for {hour:%H:%M} ({len(script.split())} words): {script}")
+    news_dir = os.path.join(get_station_dir(station_id), NEWS_DIR_NAME)
+    os.makedirs(news_dir, exist_ok=True)
+    for name in sorted(f for f in os.listdir(news_dir) if f.endswith(".mp3"))[:-3]:
+        os.remove(os.path.join(news_dir, name))
+    path = os.path.abspath(os.path.join(news_dir, f"{hour:%Y%m%d-%H}.mp3"))
+    if not await generate_audio(script, path, config['voice']):
+        return None
+    return path
+
+
+def queue_news(player, path, config, settings):
+    """Puts a news segment on air: radio.liq fades out the current track,
+    plays the segment, then carries on with the next track."""
+    player.push(path, {"artist": config['name'], "title": settings['title']}, queue=NEWS_QUEUE_ID)
+    log.info(f"News on air ({track_duration(path) / 60:.1f} min).", extra=SUMMARY)
+
+
+async def news_loop(station_id):
+    """For a station with news sources (see news.news_settings), prepares a
+    news segment NEWS_PREPARE_MINUTES before every full hour and puts it on
+    air on the hour. Re-reads the station's settings every time, so news can
+    be switched on or off without a restart."""
+    player = Liquidsoap(get_socket_file(station_id))
+    while True:
+        now = datetime.datetime.now()
+        next_hour = now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
+        prepare_at = next_hour - datetime.timedelta(minutes=NEWS_PREPARE_MINUTES)
+        if now < prepare_at:
+            await asyncio.sleep(min((prepare_at - now).total_seconds(), 600))
+            continue
+        try:
+            config = load_station_config(station_id)
+            settings = news.news_settings(config)
+            path = settings and await prepare_news_segment(station_id, config, settings, next_hour)
+            await asyncio.sleep(max(0.0, (next_hour - datetime.datetime.now()).total_seconds()))
+            if path:
+                await loop_run(queue_news, player, path, config, settings)
+        except OSError as e:
+            log.error(f"Couldn't put the news on air, Liquidsoap unreachable: {e}")
+        except Exception:
+            log.exception("News segment failed")
+        await asyncio.sleep(max(1.0, (next_hour - datetime.datetime.now()).total_seconds() + 1))
+
+
+async def loop_run(func, *args):
+    """Runs a blocking function in the default executor."""
+    return await asyncio.get_event_loop().run_in_executor(None, func, *args)
+
+
 def run_scanner_once():
     """Runs scanner.py to (re)index the music library. Several stations may
     each run their own --loop process against the same music_library.db;
@@ -1049,12 +1163,12 @@ async def feed_player(station_id):
 
 
 async def main():
-    flags = {"--loop", "--rebuild-roster"}
+    flags = {"--loop", "--rebuild-roster", "--news-now"}
     args = [a for a in sys.argv[1:] if a not in flags]
     loop_mode = "--loop" in sys.argv[1:]
 
     if len(args) < 1:
-        print("Usage: python dj_agent.py <station_id> [--loop | --rebuild-roster]")
+        print("Usage: python dj_agent.py <station_id> [--loop | --rebuild-roster | --news-now]")
         return
 
     station_id = args[0]
@@ -1073,6 +1187,19 @@ async def main():
         # regenerates it from the new one.
         if os.path.exists(get_fallback_file(station_id)):
             os.remove(get_fallback_file(station_id))
+        return
+
+    if "--news-now" in sys.argv[1:]:
+        # Prepare this hour's news segment and put it on air right away.
+        config = load_station_config(station_id)
+        settings = news.news_settings(config)
+        if not settings:
+            log.error("This station has no news sources configured.")
+            return
+        hour = datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
+        path = await prepare_news_segment(station_id, config, settings, hour)
+        if path:
+            queue_news(Liquidsoap(get_socket_file(station_id)), path, config, settings)
         return
 
     if not loop_mode:
@@ -1100,6 +1227,8 @@ async def main():
     # Scan the library in the background: once now, then periodically. Runs
     # independently of block generation, so it never delays playback.
     asyncio.create_task(scanner_loop(station_id))
+    # Hourly news segments, if the station has news sources.
+    asyncio.create_task(news_loop(station_id))
 
     await feed_player(station_id)
 

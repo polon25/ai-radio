@@ -7,3 +7,4 @@ __pycache__/
 stations/
 logs/
 scanner.lock
+news_cache/

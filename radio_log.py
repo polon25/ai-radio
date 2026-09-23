@@ -201,7 +201,12 @@ class LiquidsoapLogForwarder(threading.Thread):
             time.sleep(self.interval)
 
     def poll(self):
+        self._forward_new_lines()
+        # Only after reading what's new: a track that started since the last
+        # poll ends the silence, which then wasn't dead air.
         self._check_dead_air(time.time())
+
+    def _forward_new_lines(self):
         if not os.path.exists(self.spool_path):
             return
         with open(self.spool_path, "rb") as f:

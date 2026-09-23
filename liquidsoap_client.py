@@ -8,8 +8,9 @@ after "quit".
 import re
 import socket
 
-# Must match the request.equeue id in radio.liq.
+# Must match the request.equeue ids in radio.liq.
 QUEUE_ID = "blocks"
+NEWS_QUEUE_ID = "news"
 # "annotate:key="value",...:<path>", as push() builds it (the server may
 # report the quotes backslash-escaped)
 ANNOTATE_RE = re.compile(r'^annotate:(?:[^=:,]+=\\?"[^"]*?\\?",?)*:(.*)$')
@@ -36,9 +37,10 @@ class Liquidsoap:
         lines = b"".join(chunks).decode("utf-8", "replace").replace("\r", "").split("\n")
         return [line for line in lines if line and line not in ("END", "Bye!")]
 
-    def push(self, path, metadata=None):
-        """Appends a file to the block queue, optionally with metadata that
-        overrides its tags (e.g. {"title": "..."}); returns its request ID."""
+    def push(self, path, metadata=None, queue=QUEUE_ID):
+        """Appends a file to a queue (the block queue by default), optionally
+        with metadata that overrides its tags (e.g. {"title": "..."});
+        returns its request ID."""
         uri = path
         if metadata:
             fields = ",".join(
@@ -46,7 +48,7 @@ class Liquidsoap:
                 for key, value in metadata.items()
             )
             uri = f"annotate:{fields}:{path}"
-        return int(self.command(f"{QUEUE_ID}.push {uri}")[0])
+        return int(self.command(f"{queue}.push {uri}")[0])
 
     def queue(self):
         """Request IDs in the block queue, including the one playing now."""

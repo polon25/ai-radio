@@ -143,6 +143,31 @@ year and genre of its roster's tracks that have none in their tags; each
 track is asked about once. Years and genres also appear, next to example
 track titles, in the artist lists the AI classifies rosters from.
 
+### News
+
+A station with news sources gets a news segment at the top of every hour.
+Ten minutes before, the agent
+
+1. collects headlines from the station's `news.sources` — news sites' front
+   pages (links that look like articles) or RSS/Atom feeds,
+2. asks the AI to pick the `count` most important distinct stories, focusing
+   on `topics`,
+3. fetches those articles' text (for sites that block it, e.g. the New York
+   Times, the feed's summary is used instead),
+4. asks the AI to rewrite each story as a short spoken news item — keeping
+   to the facts in the material, summarizing rather than padding, within a
+   word budget worked out from `max_minutes`,
+5. wraps them in the station's `intro` and `outro` and turns the text into
+   speech.
+
+On the hour, `radio.liq` fades out whatever is playing, plays the news, and
+carries on with the next track. Stations with the same news settings share
+each hour's stories (written once, cached in `news_cache/`), so only the
+station's name in the intro and its voice differ. `dj_agent.py <station_id>
+--news-now` prepares a segment and puts it on air immediately, e.g. to try
+the settings out. See [Configuring a station](#configuring-a-station) for
+the settings.
+
 ### Station files
 
 Everything a station generates at runtime lives in its own folder,
@@ -151,6 +176,7 @@ Everything a station generates at runtime lives in its own folder,
 | File | Contents |
 |---|---|
 | `intros/` | Generated DJ intros, one per block (the newest few are kept) |
+| `news/` | Generated news segments (the newest few are kept) |
 | `fallback.txt` | Tracks `radio.liq` plays if the block queue runs dry |
 | `liquidsoap.sock` | Liquidsoap's command socket, used by `dj_agent.py` |
 | `artists.json` | The [artist roster](#artist-roster) |
@@ -288,6 +314,25 @@ keyed by station ID:
   genres](#release-years-and-genres). Optional; no limit by default.
 - `allow_unknown_year` — whether tracks with no known release year may play
   on a station with `years`. Optional, defaults to `true`.
+- `news` — hourly news segments (see [News](#news)); leave it out, or leave
+  `sources` empty, for none. Its fields:
+  - `sources` — news sites' front pages or RSS/Atom feed URLs, e.g.
+    `["https://www.gazeta.pl", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"]`.
+  - `count` — how many stories (default 4).
+  - `topics` — what to focus on, e.g. `["national politics", "world news",
+    "economy"]`.
+  - `max_minutes` — upper limit on the segment's length (default 15); the
+    AI is told to summarize, so it's usually much shorter.
+  - `model` — OpenRouter model to write the news with (default
+    `OPENROUTER_MODEL`); worth setting to a large model that writes the
+    station's language well, since `openrouter/free` sometimes picks small
+    ones that garble it. Falls back to `OPENROUTER_MODEL` if unavailable.
+  - `title` — the segment's title in the stream (default `"News"`).
+  - `intro` / `outro` — the segment's fixed opening and closing lines;
+    `intro` can use `{hour}`, `{station_name}` and `{topics}` (the stories'
+    topic labels). They default to English.
+  The news is written in the language of the station's `voice` (e.g. Polish
+  for `pl-PL-...`).
 - `roster_prompt` and `prompt` must each produce raw JSON with a
   `selected_indices` field (`prompt` additionally needs `dj_script`); see the
   `ciezki_mlot` entry for the exact contract each is held to. `prompt` can use
