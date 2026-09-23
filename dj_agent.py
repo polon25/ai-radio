@@ -32,6 +32,7 @@ llm_log = logging.getLogger("llm")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://github.com/your-username/your-project")
+# Seconds a whole OpenRouter request (including reading the answer) may take.
 OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "60"))
 # "openrouter/free" routes each request to some free model, which now and
 # then is one that can't follow the prompt (e.g. a content-safety classifier
@@ -324,25 +325,36 @@ def call_openrouter_json(prompt, purpose):
     llm_log.info(f"Request ({purpose}), model {payload['model']}, prompt {len(prompt)} chars")
     started = time.monotonic()
     try:
-        response = requests.post(
+        # requests' timeout only limits the wait for each next chunk, and
+        # OpenRouter keeps sending whitespace while a model is still working,
+        # so a slow model could hold a request for many minutes. Read the
+        # body as it arrives and enforce OPENROUTER_TIMEOUT on the total.
+        with requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers=headers,
             json=payload,
             timeout=OPENROUTER_TIMEOUT,
-        )
+            stream=True,
+        ) as response:
+            chunks = []
+            for chunk in response.iter_content(chunk_size=8192):
+                chunks.append(chunk)
+                if time.monotonic() - started > OPENROUTER_TIMEOUT:
+                    raise requests.Timeout(f"no complete answer within {OPENROUTER_TIMEOUT}s")
+            body = b"".join(chunks).decode("utf-8", "replace")
     except requests.RequestException as e:
         llm_log.warning(f"Request ({purpose}) failed after {time.monotonic() - started:.1f}s: {e}")
         raise
     elapsed = time.monotonic() - started
 
     try:
-        result = response.json()
+        result = json.loads(body)
     except Exception as e:
         llm_log.warning(
             f"Response ({purpose}) is not JSON: HTTP {response.status_code} after {elapsed:.1f}s: "
-            f"{_shorten(response.text)}"
+            f"{_shorten(body)}"
         )
-        raise ValueError(f"Failed to parse API response. Status: {response.status_code}, Text: {response.text}")
+        raise ValueError(f"Failed to parse API response. Status: {response.status_code}, Text: {body}")
 
     # Check if the response contains the expected 'choices' key
     if 'choices' not in result:
