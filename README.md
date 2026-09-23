@@ -133,6 +133,10 @@ processes are running against the same `music_library.db`, a lock on
 time — the rest just skip that round. The lock is released automatically
 when the scan's process ends, even if it's killed, so it can't go stale.
 
+A scan only opens files it doesn't know yet, plus files indexed by an older
+version of the scanner that didn't read everything it reads now (e.g. track
+lengths), so rescans stay cheap.
+
 ## Setup
 
 1. **Python environment**
@@ -193,6 +197,7 @@ keyed by station ID:
     "songs_per_block": 3,
     "use_ai_roster": true,
     "artist_cooldown_fraction": 0.1,
+    "min_track_seconds": 90,
     "fallback_script": "...",
     "roster_prompt": "... {station_name} ... {description} ... {artists_list} ...",
     "prompt": "... {station_name} ... {description} ... {artists_list} ... {song_count} ..."
@@ -211,6 +216,9 @@ keyed by station ID:
   `folder_filter`. Optional, defaults to `true`.
 - `artist_cooldown_fraction` — see [Artist cooldown](#artist-cooldown).
   Optional, defaults to `0.1`.
+- `min_track_seconds` — tracks shorter than this (intros, interludes,
+  skits, ...) are never played, and artists with only such tracks aren't
+  picked. Optional, defaults to `90`.
 - `roster_prompt` and `prompt` must each produce raw JSON with a
   `selected_indices` field (`prompt` additionally needs `dj_script`); see the
   `ciezki_mlot` entry for the exact contract each is held to. `prompt` can use

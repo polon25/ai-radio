@@ -65,6 +65,9 @@ DEFAULT_SONGS_PER_BLOCK = 3
 # repeat, e.g. 0.1 with a 70-artist roster means 7 other songs minimum
 # between two plays of the same artist. 0 disables the cooldown.
 DEFAULT_ARTIST_COOLDOWN_FRACTION = 0.1
+# Shorter tracks (intros, interludes, skits...) aren't played, unless a
+# station sets its own min_track_seconds.
+DEFAULT_MIN_TRACK_SECONDS = 90
 # Every station keeps its own runtime files (intros, roster, play history,
 # fallback list, logs) in STATIONS_DIR/<station_id>/, so they don't clutter
 # the project root or clash with other stations.
@@ -238,36 +241,42 @@ def load_station_config(station_id):
         raise ValueError(f"Station '{station_id}' not found in config.")
     return data[station_id]
 
-def folder_filter_clause(folder_filter):
-    """folder_filter may be a single SQL LIKE pattern or a list of patterns
-    (OR'd together), so a station can pull from several library folders at
-    once. Returns (sql_clause, params)."""
+def track_filter_clause(config):
+    """SQL condition (and its params) selecting the tracks a station may
+    play: those under its folder_filter (a single SQL LIKE pattern, or a
+    list of patterns OR'd together, so a station can pull from several
+    library folders at once) that are at least min_track_seconds long.
+    Tracks whose length couldn't be read are let through."""
+    folder_filter = config['folder_filter']
     patterns = folder_filter if isinstance(folder_filter, list) else [folder_filter]
-    clause = " OR ".join(["filepath LIKE ?"] * len(patterns))
-    return clause, patterns
+    folders = " OR ".join(["filepath LIKE ?"] * len(patterns))
+    min_seconds = config.get('min_track_seconds', DEFAULT_MIN_TRACK_SECONDS)
+    clause = f"({folders}) AND (duration IS NULL OR duration >= ?)"
+    return clause, list(patterns) + [min_seconds]
 
 
-def get_all_artists(folder_filter):
-    """Fetches every unique artist in the library matching the folder filter."""
-    clause, params = folder_filter_clause(folder_filter)
+def get_all_artists(config):
+    """Fetches every unique artist with at least one track the station may
+    play."""
+    clause, params = track_filter_clause(config)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(f"""
         SELECT DISTINCT artist FROM tracks
-        WHERE ({clause}) AND artist != 'Unknown Artist'
+        WHERE {clause} AND artist != 'Unknown Artist'
     """, params)
     artists = [row[0] for row in c.fetchall()]
     conn.close()
     return artists
 
-def get_track_by_artist(artist, folder_filter):
+def get_track_by_artist(artist, config):
     """Fetches a random track for a specific artist."""
-    clause, params = folder_filter_clause(folder_filter)
+    clause, params = track_filter_clause(config)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(f"""
         SELECT filepath, artist, title FROM tracks
-        WHERE ({clause}) AND artist = ?
+        WHERE {clause} AND artist = ?
         ORDER BY RANDOM() LIMIT 1
     """, params + [artist])
     track = c.fetchone()
@@ -497,7 +506,7 @@ def refresh_fallback_list(station_id):
     config = load_station_config(station_id)
     tracks = []
     for artist in random.sample(artists, min(len(artists), FALLBACK_TRACKS)):
-        track = get_track_by_artist(artist, config['folder_filter'])
+        track = get_track_by_artist(artist, config)
         if track:
             tracks.append(track[0])
     tmp_path = f"{path}.tmp"
@@ -552,7 +561,7 @@ async def run_station(station_id):
     # wrongly exclude legitimate artists it doesn't recognize. Those just get
     # everything under folder_filter as "allowed".
     roster = load_artist_roster(station_id)
-    current_artists = get_all_artists(config['folder_filter'])
+    current_artists = get_all_artists(config)
 
     if not use_ai_roster:
         if set(roster["allowed"]) != set(current_artists) or roster["banned"]:
@@ -644,7 +653,7 @@ async def run_station(station_id):
     # 4. Fetch one random track for each selected artist
     selected_tracks = []
     for artist in selected_artists:
-        track = get_track_by_artist(artist, config['folder_filter'])
+        track = get_track_by_artist(artist, config)
         if track:
             selected_tracks.append(track)
         else:
