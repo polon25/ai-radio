@@ -374,7 +374,16 @@ def assemble_script(stories, settings, station_name, hour):
 
 def cache_key(settings, language):
     """Identifies the news content (not the station), so stations with the
-    same sources and topics share one segment's stories per hour."""
+    same news settings share one segment's stories per hour."""
     relevant = {k: settings.get(k) for k in ("sources", "count", "topics", "story_minutes", "max_minutes", "models")}
+    relevant["language"] = language
+    return json.dumps(relevant, sort_keys=True, ensure_ascii=False)
+
+
+def history_key(settings, language):
+    """Identifies which bulletins count as "the same news" for not repeating
+    stories: same sources, topics and language, regardless of e.g. the
+    models or length (which may change from one hour to the next)."""
+    relevant = {k: settings.get(k) for k in ("sources", "topics")}
     relevant["language"] = language
     return json.dumps(relevant, sort_keys=True, ensure_ascii=False)

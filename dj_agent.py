@@ -12,6 +12,7 @@ import asyncio
 import collections
 import datetime
 import fcntl
+import glob
 import hashlib
 import edge_tts
 import imageio_ffmpeg
@@ -1084,8 +1085,14 @@ def get_news_stories(settings, language, hour):
     ask has the AI write them (see news.build_stories) while holding a lock;
     stations with the same settings then reuse them from NEWS_CACHE_DIR."""
     os.makedirs(NEWS_CACHE_DIR, exist_ok=True)
-    digest = hashlib.sha1(news.cache_key(settings, language).encode("utf-8")).hexdigest()[:12]
-    base = os.path.join(NEWS_CACHE_DIR, f"{hour:%Y%m%d-%H}-{digest}")
+
+    def digest(key):
+        return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+
+    # <hour>-<history digest>-<settings digest>: the latter says whose stories
+    # these are, the former which earlier bulletins not to repeat.
+    history = digest(news.history_key(settings, language))
+    base = os.path.join(NEWS_CACHE_DIR, f"{hour:%Y%m%d-%H}-{history}-{digest(news.cache_key(settings, language))}")
     with open(base + ".lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if os.path.exists(base + ".json"):
@@ -1101,8 +1108,7 @@ def get_news_stories(settings, language, hour):
         recent = []
         for hours_ago in range(1, settings['avoid_repeat_hours'] + 1):
             earlier = hour - datetime.timedelta(hours=hours_ago)
-            path = os.path.join(NEWS_CACHE_DIR, f"{earlier:%Y%m%d-%H}-{digest}.json")
-            if os.path.exists(path):
+            for path in glob.glob(os.path.join(NEWS_CACHE_DIR, f"{earlier:%Y%m%d-%H}-{history}-*.json")):
                 with open(path, encoding="utf-8") as f:
                     recent.extend(json.load(f))
         stories = news.build_stories(settings, language, ask_json, recent)
