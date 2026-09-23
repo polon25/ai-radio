@@ -90,27 +90,38 @@ def load_station_config(station_id):
         raise ValueError(f"Station '{station_id}' not found in config.")
     return data[station_id]
 
+def folder_filter_clause(folder_filter):
+    """folder_filter may be a single SQL LIKE pattern or a list of patterns
+    (OR'd together), so a station can pull from several library folders at
+    once. Returns (sql_clause, params)."""
+    patterns = folder_filter if isinstance(folder_filter, list) else [folder_filter]
+    clause = " OR ".join(["filepath LIKE ?"] * len(patterns))
+    return clause, patterns
+
+
 def get_all_artists(folder_filter):
     """Fetches every unique artist in the library matching the folder filter."""
+    clause, params = folder_filter_clause(folder_filter)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("""
+    c.execute(f"""
         SELECT DISTINCT artist FROM tracks
-        WHERE filepath LIKE ? AND artist != 'Unknown Artist'
-    """, (folder_filter,))
+        WHERE ({clause}) AND artist != 'Unknown Artist'
+    """, params)
     artists = [row[0] for row in c.fetchall()]
     conn.close()
     return artists
 
 def get_track_by_artist(artist, folder_filter):
     """Fetches a random track for a specific artist."""
+    clause, params = folder_filter_clause(folder_filter)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("""
-        SELECT filepath, artist, title FROM tracks 
-        WHERE filepath LIKE ? AND artist = ? 
+    c.execute(f"""
+        SELECT filepath, artist, title FROM tracks
+        WHERE ({clause}) AND artist = ?
         ORDER BY RANDOM() LIMIT 1
-    """, (folder_filter, artist))
+    """, params + [artist])
     track = c.fetchone()
     conn.close()
     return track
@@ -254,27 +265,35 @@ async def run_station(station_id):
     playlist_file = get_playlist_file(station_id)
     dj_audio_file = get_intro_audio_file(station_id)
     song_count = config.get('songs_per_block', DEFAULT_SONGS_PER_BLOCK)
+    use_ai_roster = config.get('use_ai_roster', True)
 
-    # 1. Load this station's artist roster (allowed + banned), building it on
-    # first run so that even a random fallback pick stays on-theme instead of
-    # drawing from the whole library.
+    # 1. Load this station's artist roster (allowed + banned). Some stations
+    # don't want AI curation at all (use_ai_roster=false) — e.g. a folder
+    # that's already a dedicated, niche collection, where AI filtering could
+    # wrongly exclude legitimate artists it doesn't recognize. Those just get
+    # everything under folder_filter as "allowed".
     roster = load_artist_roster(station_id)
-    if not roster["allowed"] and not roster["banned"]:
+    current_artists = get_all_artists(config['folder_filter'])
+
+    if not use_ai_roster:
+        if set(roster["allowed"]) != set(current_artists) or roster["banned"]:
+            roster["allowed"], roster["banned"] = current_artists, []
+            save_artist_roster(station_id, roster)
+    elif not roster["allowed"] and not roster["banned"]:
         print(f"No artist roster found for '{station_id}'. Building one from the whole library...")
-        candidates = get_all_artists(config['folder_filter'])
-        if not candidates:
+        if not current_artists:
             print(f"No artists found matching filter: {config['folder_filter']}!")
             return
         try:
             fitting, non_fitting = classify_artists(
-                candidates, config['roster_prompt'], config['name'], config['description']
+                current_artists, config['roster_prompt'], config['name'], config['description']
             )
             if not fitting:
                 raise ValueError("AI did not select any artists for the roster.")
             roster["allowed"], roster["banned"] = fitting, non_fitting
         except Exception as e:
             print(f"Error building artist roster: {e}. Using the full candidate pool instead.")
-            roster["allowed"] = candidates
+            roster["allowed"] = current_artists
         save_artist_roster(station_id, roster)
     else:
         # 1b. Check whether new artists have shown up in the library (e.g. a
@@ -282,7 +301,7 @@ async def run_station(station_id):
         # every artist we've ever seen ends up in either "allowed" or
         # "banned", so this stays cheap once the roster has caught up.
         known = set(roster["allowed"]) | set(roster["banned"])
-        new_artists = [a for a in get_all_artists(config['folder_filter']) if a not in known]
+        new_artists = [a for a in current_artists if a not in known]
         if new_artists:
             print(f"Found {len(new_artists)} new artist(s) in the library. Checking if they fit '{config['name']}'...")
             try:

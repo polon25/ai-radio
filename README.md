@@ -48,6 +48,13 @@ that falls back to a random pick (AI request failed) still draws only from
 `allowed`, so it always stays on-theme. You can hand-edit either list at any
 time — an artist you add to `banned` is never asked about again.
 
+AI classification is optional — set `"use_ai_roster": false` on a station and
+every artist under its `folder_filter` becomes `allowed`, no AI call
+involved. This is the right choice for a folder that's already a dedicated,
+niche collection (a specific fandom's music, a soundtrack folder, ...): AI
+classification adds no value there, and risks wrongly banning legitimate
+artists it just doesn't recognize.
+
 ## Setup
 
 1. **Python environment**
@@ -100,6 +107,7 @@ keyed by station ID:
     "voice": "pl-PL-MarekNeural",
     "folder_filter": "%/Inna muzyka/%",
     "songs_per_block": 3,
+    "use_ai_roster": true,
     "fallback_script": "...",
     "roster_prompt": "... {station_name} ... {description} ... {artists_list} ...",
     "prompt": "... {station_name} ... {description} ... {artists_list} ... {song_count} ..."
@@ -109,9 +117,13 @@ keyed by station ID:
 
 - `folder_filter` is a SQL `LIKE` pattern matched against each track's file
   path in `music_library.db` — this is what scopes a station to a subset of
-  the scanned library.
+  the scanned library. It can also be a list of patterns (`["%/A/%",
+  "%/B/%"]`) to pull from several folders that don't share a common parent.
 - `songs_per_block` — how many tracks per generated block (plus the intro).
   Optional, defaults to 3.
+- `use_ai_roster` — whether to AI-classify artists into allowed/banned (see
+  [Artist roster](#artist-roster)) or just allow everything under
+  `folder_filter`. Optional, defaults to `true`.
 - `roster_prompt` and `prompt` must each produce raw JSON with a
   `selected_indices` field (`prompt` additionally needs `dj_script`); see the
   `metal_pl` entry for the exact contract each is held to. `prompt` can use
