@@ -1,3 +1,5 @@
+# The project directory and User below are filled in on install;
+# see README, "Running at boot".
 [Unit]
 Description=AI Radio - Liquidsoap player (%i)
 After=network.target icecast2.service
@@ -5,11 +7,11 @@ Wants=icecast2.service
 
 [Service]
 Type=simple
-User=polonius
-WorkingDirectory=/home/polonius/Programy/Radio
-EnvironmentFile=/home/polonius/Programy/Radio/.env
+User=radio
+WorkingDirectory=/opt/ai-radio
+EnvironmentFile=/opt/ai-radio/.env
 Environment=STATION_ID=%i
-ExecStart=/usr/bin/liquidsoap /home/polonius/Programy/Radio/radio.liq
+ExecStart=/usr/bin/liquidsoap /opt/ai-radio/radio.liq
 Restart=on-failure
 RestartSec=5
 

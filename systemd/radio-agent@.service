@@ -1,3 +1,5 @@
+# The project directory and User below are filled in on install;
+# see README, "Running at boot".
 [Unit]
 Description=AI Radio - DJ agent loop (%i)
 After=network-online.target
@@ -5,11 +7,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=polonius
-WorkingDirectory=/home/polonius/Programy/Radio
-EnvironmentFile=/home/polonius/Programy/Radio/.env
+User=radio
+WorkingDirectory=/opt/ai-radio
+EnvironmentFile=/opt/ai-radio/.env
 Environment=STATION_ID=%i
-ExecStart=/home/polonius/Programy/Radio/venv/bin/python -u /home/polonius/Programy/Radio/dj_agent.py %i --loop
+ExecStart=/opt/ai-radio/venv/bin/python -u /opt/ai-radio/dj_agent.py %i --loop
 Restart=on-failure
 RestartSec=5
 

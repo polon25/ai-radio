@@ -476,31 +476,31 @@ liquidsoap radio.liq &
 
 ### Running at boot (systemd)
 
-Template units are in `systemd/`. Install once:
+Template units are in `systemd/`: `radio-liquidsoap@.service` and
+`radio-agent@.service` (one instance per station) and `radio-web.service`
+(the [web page](#web-page), one for all stations). Install them once, from
+the project directory, filling in its path and the user to run as:
 
 ```bash
-sudo cp systemd/radio-liquidsoap@.service systemd/radio-agent@.service /etc/systemd/system/
+for unit in radio-liquidsoap@.service radio-agent@.service radio-web.service; do
+  sed "s|/opt/ai-radio|$PWD|g; s|^User=radio|User=$USER|" "systemd/$unit" \
+    | sudo tee "/etc/systemd/system/$unit" > /dev/null
+done
 sudo systemctl daemon-reload
 ```
 
-Then enable a station by its ID (the `@<id>` becomes `$STATION_ID`):
+Then enable each station by its ID (the `@<id>` becomes `$STATION_ID`), and
+the web page:
 
 ```bash
 sudo systemctl enable --now radio-liquidsoap@ciezki_mlot.service
 sudo systemctl enable --now radio-agent@ciezki_mlot.service
+sudo systemctl enable --now radio-web.service
 ```
 
 Adding another station later is just another `enable --now` pair with a
 different ID — no new unit files needed. Logs: see [Logs](#logs), or
 `journalctl -u radio-agent@ciezki_mlot -f`.
-
-The [web page](#web-page) has one unit for all stations:
-
-```bash
-sudo cp systemd/radio-web.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now radio-web.service
-```
 
 ## Web page
 
@@ -519,8 +519,8 @@ It uses only the standard library: static files plus one JSON endpoint,
 ./venv/bin/python web_server.py      # http://<host>:8080
 ```
 
-or install `systemd/radio-web.service` like the other units and
-`sudo systemctl enable --now radio-web.service`. Settings (in `.env`):
+or run it as a service (see [Running at boot](#running-at-boot-systemd)).
+Settings (in `.env`):
 
 | Variable | Meaning |
 |---|---|
