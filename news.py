@@ -3,7 +3,7 @@ or RSS/Atom feeds), has the AI pick the most important stories and rewrite
 them for radio, and assembles the segment's script.
 
 The AI steps go through a JSON-asking function passed in by the caller
-(dj_agent.ask_llm_json), so this module has no dependency on the agent.
+(llm.ask_llm_json, via dj_agent), so this module has no dependency on the agent.
 """
 
 import json

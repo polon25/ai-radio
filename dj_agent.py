@@ -9,26 +9,23 @@ import json
 import logging
 import os
 import random
-import re
 import sqlite3
 import subprocess
 import sys
 import time
 
-import edge_tts
-import imageio_ffmpeg
-import requests
 from dotenv import load_dotenv
-from mutagen import File as MutagenFile
 
-# Load environment variables from .env file (before importing radio_log,
-# which reads its settings from the environment too)
+# Load environment variables from .env file (before importing the modules
+# below, which read their settings from the environment too)
 load_dotenv()
 
 import news
 import programs
 import scanner
+from audio import block_duration, generate_audio, measure_loudness, track_duration
 from liquidsoap_client import NEWS_QUEUE_ID, Liquidsoap
+from llm import OPENROUTER_BACKGROUND_TIMEOUT, ask_llm_json, pick_by_indices, shorten
 from radio_log import (
     LIQUIDSOAP_SPOOL_FILE, SUMMARY, LiquidsoapLogForwarder, setup_logging,
 )
@@ -41,18 +38,6 @@ sys.stdout.reconfigure(line_buffering=True)
 log = logging.getLogger("agent")
 llm_log = logging.getLogger("llm")
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://github.com/your-username/your-project")
-# Seconds a whole OpenRouter request (including reading the answer) may take.
-OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "60"))
-# The same for background work nothing on air waits for (classifying
-# artists, filling in track info): long lists take slow models a while.
-OPENROUTER_BACKGROUND_TIMEOUT = int(os.getenv("OPENROUTER_BACKGROUND_TIMEOUT", "180"))
-# "openrouter/free" routes each request to some free model, which now and
-# then is one that can't follow the prompt (e.g. a content-safety classifier
-# answering "User Safety: safe"), so unusable answers are retried.
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
-OPENROUTER_ATTEMPTS = int(os.getenv("OPENROUTER_ATTEMPTS", "3"))
 # In --loop mode, the next block is prepared as soon as the last queued track
 # starts playing, or earlier if less than this many seconds of music are left
 # in Liquidsoap's queue (so a short last track doesn't leave too little time
@@ -62,10 +47,6 @@ BLOCK_LEAD_TIME = int(os.getenv("BLOCK_LEAD_TIME", "120"))
 # before retrying a block that failed to generate.
 QUEUE_POLL_INTERVAL = 5
 BLOCK_RETRY_DELAY = 15
-# Loudness (LUFS) DJ intros and news are raised to, before a limiter shaves
-# their peaks (which leaves them about 1.5 LU below it): a little below the
-# typical mastered music they play between, which is often around -8.
-SPEECH_LOUDNESS_LUFS = float(os.getenv("SPEECH_LOUDNESS_LUFS", "-10"))
 # Music is evened out to this loudness (LUFS) by a per-track gain (applied by
 # radio.liq's amplify). Louder tracks are always brought down to it; quieter
 # ones are only raised as far as their peaks allow (staying below
@@ -76,11 +57,6 @@ SPEECH_LOUDNESS_LUFS = float(os.getenv("SPEECH_LOUDNESS_LUFS", "-10"))
 MUSIC_LOUDNESS_LUFS = float(os.getenv("MUSIC_LOUDNESS_LUFS", "-13"))
 MUSIC_MAX_PEAK_DBTP = -1.0
 MUSIC_GAIN_RANGE_DB = (-20.0, 12.0)
-# Edge TTS is an online service: seconds to wait before each retry (so one
-# try more than there are delays) before a block goes on air without its
-# intro. Blocks are prepared minutes ahead, so this can ride out a DNS or
-# network hiccup of up to about a minute.
-TTS_RETRY_DELAYS = (5, 15, 30)
 # The fallback list radio.liq plays from if the block queue runs dry: this
 # many random tracks from the station's roster, refreshed this often.
 FALLBACK_TRACKS = 50
@@ -401,155 +377,6 @@ def format_artist_list(artists):
     return "\n".join([f"{i+1}. {artist}" for i, artist in enumerate(artists)])
 
 
-def _shorten(text, limit=500):
-    """Trims long API payloads so a single bad response can't flood the log."""
-    text = str(text)
-    return text if len(text) <= limit else text[:limit] + f"... ({len(text)} chars)"
-
-
-def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT, model=None, avoid=()):
-    """Sends a prompt to OpenRouter and parses the response as JSON. The
-    prompt must instruct the model to reply with raw JSON. `purpose` only
-    labels the request in the logs. `model` asks for a specific model, with
-    OpenRouter falling back to OPENROUTER_MODEL if it's unavailable. An
-    answer from a model whose name starts with one of `avoid` is rejected
-    (as unusable), e.g. small models openrouter/free picks that garble the
-    station's language. Every failure is logged (under the "llm"
-    component) before being raised."""
-    if not OPENROUTER_API_KEY:
-        raise ValueError("OPENROUTER_API_KEY is missing. Check your .env file.")
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "HTTP-Referer": OPENROUTER_SITE_URL,
-        "X-Title": "AI Radio Project"
-    }
-
-    payload = {
-        "model": model or OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a precise radio automation agent. You always output valid raw JSON."},
-            {"role": "user", "content": prompt}
-        ]
-    }
-
-    if model and model != OPENROUTER_MODEL:
-        payload["models"] = [model, OPENROUTER_MODEL]
-    llm_log.info(f"Request ({purpose}), model {payload['model']}, prompt {len(prompt)} chars")
-    started = time.monotonic()
-    try:
-        # requests' timeout only limits the wait for each next chunk, and
-        # OpenRouter keeps sending whitespace while a model is still working,
-        # so a slow model could hold a request for many minutes. Read the
-        # body as it arrives and enforce `timeout` on the total.
-        with requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=timeout,
-            stream=True,
-        ) as response:
-            chunks = []
-            for chunk in response.iter_content(chunk_size=8192):
-                chunks.append(chunk)
-                if time.monotonic() - started > timeout:
-                    raise requests.Timeout(f"no complete answer within {timeout}s")
-            body = b"".join(chunks).decode("utf-8", "replace")
-    except requests.RequestException as e:
-        llm_log.warning(f"Request ({purpose}) failed after {time.monotonic() - started:.1f}s: {e}")
-        raise
-    elapsed = time.monotonic() - started
-
-    try:
-        result = json.loads(body)
-    except ValueError:
-        llm_log.warning(
-            f"Response ({purpose}) is not JSON: HTTP {response.status_code} after {elapsed:.1f}s: "
-            f"{_shorten(body)}"
-        )
-        raise ValueError(f"Failed to parse API response. Status: {response.status_code}, Text: {body}")
-
-    # Check if the response contains the expected 'choices' key
-    if 'choices' not in result:
-        llm_log.warning(
-            f"API error ({purpose}): HTTP {response.status_code} after {elapsed:.1f}s: "
-            f"{_shorten(json.dumps(result.get('error', result), ensure_ascii=False))}"
-        )
-        raise KeyError("OpenRouter did not return 'choices'.")
-
-    model = result.get("model", "?")
-    if any(model.startswith(prefix) for prefix in avoid):
-        llm_log.warning(f"Rejected the answer ({purpose}) from {model}, a model to avoid for this")
-        raise ValueError(f"{model} is on the list of models to avoid.")
-    usage = result.get("usage") or {}
-    llm_log.info(
-        f"Response ({purpose}) from {model} in {elapsed:.1f}s "
-        f"(tokens: {usage.get('prompt_tokens', '?')} in, {usage.get('completion_tokens', '?')} out)"
-    )
-
-    raw_content = (result['choices'][0]['message'].get('content') or "").strip()
-    if not raw_content:
-        llm_log.warning(f"Empty response ({purpose}) from {model}")
-        raise ValueError(f"{model} returned an empty response.")
-
-    # Models sometimes wrap the JSON in a markdown code block or some prose
-    # anyway, or follow it with more text or even a second JSON object, so
-    # parse the first complete object starting at the first "{". strict=False
-    # accepts raw newlines inside strings (e.g. a multi-line DJ script).
-    start = raw_content.find("{")
-    try:
-        parsed, _ = json.JSONDecoder(strict=False).raw_decode(raw_content[max(start, 0):])
-    except json.JSONDecodeError as e:
-        llm_log.warning(f"Invalid JSON ({purpose}) from {model}: {e}: {_shorten(raw_content)}")
-        raise
-    if not isinstance(parsed, dict):
-        llm_log.warning(f"JSON ({purpose}) from {model} is not an object: {_shorten(raw_content)}")
-        raise ValueError(f"{model} returned JSON that isn't an object.")
-    return parsed
-
-
-def ask_llm_json(prompt, purpose, validate, timeout=OPENROUTER_TIMEOUT, models=(), avoid=()):
-    """call_openrouter_json(), retried until `validate(parsed)` accepts the
-    answer (it raises ValueError/KeyError on an unusable one) and returns
-    what the caller needs from it. Raises the last error if every attempt
-    fails.
-
-    `models` are preferred models, tried first, one attempt each, in order;
-    then OPENROUTER_ATTEMPTS attempts go to OPENROUTER_MODEL. So preferred
-    models that are down, slow or answering badly never eat into the usual
-    attempts. Answers from `avoid` models are rejected (see
-    call_openrouter_json)."""
-    attempts = len(models) + OPENROUTER_ATTEMPTS
-    for attempt in range(1, attempts + 1):
-        model = models[attempt - 1] if attempt <= len(models) else None
-        try:
-            return validate(call_openrouter_json(prompt, purpose, timeout, model, avoid))
-        except (requests.RequestException, ValueError, KeyError) as e:
-            if attempt == attempts:
-                raise
-            llm_log.info(f"Retrying ({purpose}), attempt {attempt + 1}/{attempts}, after: {e}")
-
-
-def pick_by_indices(indices, candidates, purpose):
-    """Maps the 1-based `selected_indices` an AI returned onto `candidates`,
-    logging (and skipping) any that are malformed, out of range or repeated."""
-    if not isinstance(indices, list):
-        llm_log.warning(f"'selected_indices' ({purpose}) is not a list: {_shorten(indices)}")
-        return []
-    picked, invalid = [], []
-    for i in indices:
-        if isinstance(i, int) and 0 < i <= len(candidates) and candidates[i - 1] not in picked:
-            picked.append(candidates[i - 1])
-        else:
-            invalid.append(i)
-    if invalid:
-        llm_log.warning(
-            f"Ignored {len(invalid)} invalid/duplicate index(es) ({purpose}) "
-            f"out of 1..{len(candidates)}: {_shorten(invalid, 200)}"
-        )
-    return picked
-
-
 def curate_artists_and_script(artists, prompt_template, station_name, description, song_count, models=(),
                               avoid=()):
     """Asks the AI to pick `song_count` artists for the next block and write
@@ -565,7 +392,7 @@ def curate_artists_and_script(artists, prompt_template, station_name, descriptio
     def validate(parsed_data):
         script = parsed_data.get("dj_script")
         if "selected_indices" not in parsed_data or not isinstance(script, str) or not script.strip():
-            llm_log.warning(f"Curation response is missing fields: {_shorten(json.dumps(parsed_data, ensure_ascii=False))}")
+            llm_log.warning(f"Curation response is missing fields: {shorten(json.dumps(parsed_data, ensure_ascii=False))}")
             raise KeyError("AI response lacks 'selected_indices' or 'dj_script'.")
         selected = pick_by_indices(parsed_data["selected_indices"], artists, "curation")
         if not selected:
@@ -689,75 +516,6 @@ def update_roster(station_id, config, current_artists, rebuild=False, classify=T
     return roster
 
 
-def finish_speech_audio(path):
-    """Re-encodes Edge TTS output in place so it plays well between songs:
-
-    - Edge TTS outputs mono MP3s, but some Liquidsoap decoders (e.g. 1.4.x)
-      require the file's channel count to exactly match
-      `frame.audio.channels` (2 by default) and refuse to play anything
-      else, so the channel is duplicated to stereo.
-    - Its speech is around -20 LUFS, far quieter than most mastered music
-      (around -8), so it's normalized to SPEECH_LOUDNESS_LUFS."""
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    # Measure, then raise the level by the difference, with a limiter
-    # catching the few peaks that would clip (loudnorm alone won't raise
-    # speech that far without exceeding its peak limit).
-    measured = subprocess.run(
-        [ffmpeg, "-hide_banner", "-i", path, "-af", "loudnorm=print_format=json", "-f", "null", "-"],
-        check=True, capture_output=True, text=True,
-    ).stderr
-    loudness = float(json.loads(measured[measured.rindex("{"):measured.rindex("}") + 1])["input_i"])
-    gain = SPEECH_LOUDNESS_LUFS - loudness
-    tmp_path = f"{path}.finished.tmp.mp3"
-    subprocess.run(
-        [ffmpeg, "-y", "-i", path, "-af", f"volume={gain:.1f}dB,alimiter=limit=0.84:level=false",
-         "-ar", "44100", "-ac", "2", "-b:a", "128k", tmp_path],
-        check=True, capture_output=True,
-    )
-    os.replace(tmp_path, path)
-
-
-async def generate_audio(text, output_file, voice):
-    """Converts the generated text to speech using Edge TTS (an online
-    service), retrying a few times. Returns whether it succeeded, so a
-    network hiccup costs the block its intro rather than the whole block.
-
-    The audio is made in a temporary file and only moved into place once
-    finished, so Liquidsoap never opens a half-made file (Edge TTS writes
-    mono, which it refuses to play)."""
-    log.info(f"Generating intro with voice '{voice}': {text}")
-    attempts = len(TTS_RETRY_DELAYS) + 1
-    tmp_file = f"{output_file}.tts.tmp.mp3"
-    for attempt in range(1, attempts + 1):
-        try:
-            communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(tmp_file)
-            finish_speech_audio(tmp_file)
-            os.replace(tmp_file, output_file)
-            return True
-        except Exception as e:
-            log.warning(f"Intro speech synthesis failed (attempt {attempt}/{attempts}): {e!r}")
-            if attempt < attempts:
-                await asyncio.sleep(TTS_RETRY_DELAYS[attempt - 1])
-    log.error("Couldn't synthesize the intro; the block goes on air without it.")
-    return False
-
-
-def track_duration(path):
-    """Playback duration of an audio file in seconds, or 0 if it can't be
-    read (e.g. briefly missing/locked) rather than crashing the loop."""
-    try:
-        return MutagenFile(path).info.length
-    except Exception as e:
-        log.warning(f"Could not read duration of {path}: {e}")
-        return 0.0
-
-
-def block_duration(file_paths):
-    """Total playback duration (seconds) of a block."""
-    return sum(track_duration(path) for path in file_paths)
-
-
 def refresh_fallback_list(station_id):
     """(Re)writes the fallback list radio.liq falls back to when the block
     queue runs dry, if it's missing or older than FALLBACK_REFRESH_HOURS:
@@ -810,20 +568,6 @@ class QueueState:
             del durations[path]
         self.pending_tracks = len(pending)
         self.seconds_left = seconds
-
-
-def measure_loudness(path):
-    """A file's integrated loudness (LUFS) and true peak (dBTP), per EBU
-    R128. Decodes the whole file, so it takes a second or two."""
-    output = subprocess.run(
-        [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-nostats", "-i", path,
-         "-af", "ebur128=peak=true", "-f", "null", "-"],
-        check=True, capture_output=True, text=True,
-    ).stderr
-    summary = output[output.rindex("Summary:"):]
-    loudness = float(re.search(r"I:\s+(-?[\d.]+) LUFS", summary).group(1))
-    peak = float(re.search(r"Peak:\s+(-?[\d.]+|-inf) dBFS", summary).group(1))
-    return loudness, peak
 
 
 def music_gain(path):
@@ -1222,6 +966,8 @@ async def run_station(station_id, starts_at=None):
 async def finish_block(config, selected_tracks, dj_text, dj_audio_file):
     """Synthesizes a block's DJ script and returns its files (intro first)."""
     intro = [os.path.abspath(dj_audio_file)] if await generate_audio(dj_text, dj_audio_file, config['voice']) else []
+    if not intro:
+        log.error("The block goes on air without its intro.")
     files = intro + [track[0] for track in selected_tracks]
     log.info(
         f"Block ready (~{block_duration(files) / 60:.1f} min): {'intro + ' if intro else 'no intro, '}"
