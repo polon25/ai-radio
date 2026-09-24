@@ -915,16 +915,22 @@ RECENTLY_HEARD_SONGS = 6
 # Rough length of a DJ intro, for guessing whether a program block ends
 # after its slot does (and should close the episode) before it's written.
 DJ_INTRO_SECONDS_GUESS = 30
+# A program block ending less than this before its slot does closes the
+# episode too: there's no room for another block, and slots usually end on
+# the hour, when the news comes in between anyway.
+PROGRAM_END_MARGIN_SECONDS = 180
 
 
 def program_position(episode, starts_at, block_seconds, slot_end):
     """Where a program block falls in its episode, as an instruction for
-    the DJ: opening it, closing it (if it's expected to end after the slot
-    does, so no program block follows it), or somewhere in between."""
+    the DJ: opening it, closing it (if it's expected to end after, or just
+    before, the slot does, so no program block follows it), or somewhere in
+    between."""
     if not episode.get("blocks"):
         return ("This is the start of the episode: welcome the listeners to the station, announce the "
                 "program by its name, and say what today's episode is about.")
-    if starts_at + datetime.timedelta(seconds=block_seconds + DJ_INTRO_SECONDS_GUESS) >= slot_end:
+    ends_at = starts_at + datetime.timedelta(seconds=block_seconds + DJ_INTRO_SECONDS_GUESS)
+    if ends_at >= slot_end - datetime.timedelta(seconds=PROGRAM_END_MARGIN_SECONDS):
         return ("This is the episode's last part: introduce the songs, then mention that this is the last "
                 "part of today's program and thank the listeners.")
     return "The episode is under way (don't welcome the listeners or announce the program again)."
