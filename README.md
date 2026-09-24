@@ -306,7 +306,7 @@ mounted) is then more likely than the music being deleted.
    | `OPENROUTER_API_KEY` | OpenRouter API key, used for artist curation and DJ scripts |
    | `MUSIC_FOLDER` | Root folder `scanner.py` indexes |
    | `ICECAST_PASSWORD` | Must match `<source-password>` in `icecast.xml` |
-   | `STATION_ID` | Which entry from `stations.json` this instance runs |
+   | `STATION_ID` | Which entry from `stations.json` `radio.liq` runs, when started by hand. Leave it out of `.env` with the systemd units: they set it per station, and `.env` would override it |
    | `ICECAST_HOST` / `ICECAST_PORT` | Icecast server connection; `ICECAST_PORT` must match the `<port>` of `<listen-socket>` in `icecast.xml` |
    | `ICECAST_MOUNT` | Optional; defaults to `/<STATION_ID>` |
    | `OPENROUTER_SITE_URL` | Optional; sent as `HTTP-Referer` to OpenRouter |
