@@ -1,23 +1,25 @@
-import sqlite3
-import os
-import sys
-import json
-import logging
-import random
-import re
-import subprocess
-import time
-import requests
 import asyncio
 import collections
+import contextlib
 import datetime
 import fcntl
 import glob
 import hashlib
+import json
+import logging
+import os
+import random
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
 import edge_tts
 import imageio_ffmpeg
-from mutagen import File as MutagenFile
+import requests
 from dotenv import load_dotenv
+from mutagen import File as MutagenFile
 
 # Load environment variables from .env file (before importing radio_log,
 # which reads its settings from the environment too)
@@ -141,36 +143,45 @@ NEWS_MAX_LATE_MINUTES = 10
 NEWS_RETRY_SECONDS = 60
 
 
+def read_json(path, default):
+    """A JSON file's contents, or `default` if it's missing or unreadable."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data, **dump_args):
+    """Writes a JSON file atomically, so another process (or thread) reading
+    it never sees half a file."""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, **dump_args)
+    os.replace(tmp_path, path)
+
+
+@contextlib.contextmanager
+def library_db():
+    """A connection to the music library database, committed (unless an
+    exception escapes) and closed afterwards. Waits for a lock held by
+    another process (e.g. a scan committing) rather than failing."""
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def get_station_dir(station_id):
     """Directory holding all of this station's runtime files."""
     return os.path.join(STATIONS_DIR, station_id)
 
 
 def ensure_station_dir(station_id):
-    """Creates the station's directory and moves over any files left in the
-    project root by older versions (which named them <kind>_<station_id>.*),
-    so an upgrade keeps the existing roster and play history. Playlist and
-    intro files from older versions are no longer used and get deleted."""
-    station_dir = get_station_dir(station_id)
+    """Creates the station's directory (and its intros folder)."""
     os.makedirs(get_intros_dir(station_id), exist_ok=True)
-    legacy_files = {
-        f"artists_{station_id}.json": get_artists_file(station_id),
-        f"recent_artists_{station_id}.json": get_recent_artists_file(station_id),
-    }
-    for old_path, new_path in legacy_files.items():
-        if os.path.exists(old_path) and not os.path.exists(new_path):
-            os.replace(old_path, new_path)
-            log.info(f"Moved {old_path} -> {new_path}")
-    obsolete_files = [
-        f"dj_playlist_{station_id}.txt",
-        f"dj_intro_{station_id}.mp3",
-        os.path.join(station_dir, "playlist.txt"),
-        os.path.join(station_dir, "intro.mp3"),
-    ]
-    for path in obsolete_files:
-        if os.path.exists(path):
-            os.remove(path)
-            log.info(f"Removed obsolete {path}")
 
 
 def get_intros_dir(station_id):
@@ -212,14 +223,7 @@ def load_artist_roster(station_id):
     """Loads this station's {"allowed": [...], "banned": [...]} roster. A
     missing file yields two empty lists; a bare JSON list (old format) is
     treated as the allowed list."""
-    path = get_artists_file(station_id)
-    if not os.path.exists(path):
-        return {"allowed": [], "banned": []}
-    with open(path, "r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except json.JSONDecodeError:
-            return {"allowed": [], "banned": []}
+    data = read_json(get_artists_file(station_id), {})
     if isinstance(data, list):
         return {"allowed": data, "banned": []}
     return {"allowed": data.get("allowed", []), "banned": data.get("banned", [])}
@@ -229,10 +233,7 @@ def save_artist_roster(station_id, roster):
     """Persists the artist roster so future runs reuse it instead of
     reclassifying the whole library from scratch."""
     path = get_artists_file(station_id)
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(roster, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, path)  # atomic: the station's agent may be reading it
+    write_json(path, roster, indent=2)
     log.info(
         f"Saved roster to {path}: {len(roster['allowed'])} allowed, "
         f"{len(roster['banned'])} banned"
@@ -268,22 +269,13 @@ def get_recent_artists_file(station_id):
 
 def load_recent_artists(station_id):
     """Loads the play history (oldest first). Missing/corrupt file -> none."""
-    path = get_recent_artists_file(station_id)
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except json.JSONDecodeError:
-            return []
+    data = read_json(get_recent_artists_file(station_id), [])
     return data if isinstance(data, list) else []
 
 
 def save_recent_artists(station_id, history):
     """Persists the play history, trimmed so the file doesn't grow forever."""
-    path = get_recent_artists_file(station_id)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(history[-500:], f, ensure_ascii=False)
+    write_json(get_recent_artists_file(station_id), history[-500:])
 
 
 def artist_cooldown(pool_size, fraction):
@@ -312,6 +304,7 @@ def load_station_config(station_id):
         raise ValueError(f"Station '{station_id}' not found in config.")
     return data[station_id]
 
+
 def track_filter_clause(config, use_years=True):
     """SQL condition (and its params) selecting the tracks a station may
     play: those under its folder_filter (a single SQL LIKE pattern, or a
@@ -338,52 +331,32 @@ def get_all_artists(config):
     """Fetches every unique artist with at least one track the station may
     play."""
     clause, params = track_filter_clause(config)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(f"""
-        SELECT DISTINCT artist FROM tracks
-        WHERE {clause} AND artist != 'Unknown Artist'
-    """, params)
-    artists = [row[0] for row in c.fetchall()]
-    conn.close()
-    return artists
+    with library_db() as conn:
+        rows = conn.execute(f"""
+            SELECT DISTINCT artist FROM tracks
+            WHERE {clause} AND artist != 'Unknown Artist'
+        """, params).fetchall()
+    return [row[0] for row in rows]
 
-def get_track_by_artist(artist, config):
-    """Fetches a random track for a specific artist."""
-    clause, params = track_filter_clause(config)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(f"""
-        SELECT filepath, artist, title FROM tracks
-        WHERE {clause} AND artist = ?
-        ORDER BY RANDOM() LIMIT 1
-    """, params + [artist])
-    track = c.fetchone()
-    conn.close()
-    return track
 
 def get_station_tracks(config):
     """Every track the station may play, as (filepath, artist, title,
     duration) tuples."""
     clause, params = track_filter_clause(config)
-    conn = sqlite3.connect(DB_FILE)
-    rows = conn.execute(
-        f"SELECT filepath, artist, title, duration FROM tracks WHERE {clause}", params
-    ).fetchall()
-    conn.close()
-    return rows
+    with library_db() as conn:
+        return conn.execute(
+            f"SELECT filepath, artist, title, duration FROM tracks WHERE {clause}", params
+        ).fetchall()
 
 
 def init_play_history():
     """Creates the play history table if needed and drops entries older
     than PLAY_HISTORY_DAYS."""
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    conn.execute("""CREATE TABLE IF NOT EXISTS plays
-                    (station TEXT NOT NULL, filepath TEXT NOT NULL, played_at REAL NOT NULL)""")
-    conn.execute("CREATE INDEX IF NOT EXISTS plays_by_track ON plays (station, filepath, played_at)")
-    conn.execute("DELETE FROM plays WHERE played_at < ?", (time.time() - PLAY_HISTORY_DAYS * 86400,))
-    conn.commit()
-    conn.close()
+    with library_db() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS plays
+                        (station TEXT NOT NULL, filepath TEXT NOT NULL, played_at REAL NOT NULL)""")
+        conn.execute("CREATE INDEX IF NOT EXISTS plays_by_track ON plays (station, filepath, played_at)")
+        conn.execute("DELETE FROM plays WHERE played_at < ?", (time.time() - PLAY_HISTORY_DAYS * 86400,))
 
 
 def record_play(station_id, metadata, played_at):
@@ -392,20 +365,17 @@ def record_play(station_id, metadata, played_at):
     path = metadata.get("filename", "")
     if not path or os.path.basename(os.path.dirname(path)) in (INTROS_DIR_NAME, NEWS_DIR_NAME):
         return
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    conn.execute("INSERT INTO plays (station, filepath, played_at) VALUES (?, ?, ?)", (station_id, path, played_at))
-    conn.commit()
-    conn.close()
+    with library_db() as conn:
+        conn.execute("INSERT INTO plays (station, filepath, played_at) VALUES (?, ?, ?)",
+                     (station_id, path, played_at))
 
 
 def get_last_plays(station_id):
     """When each track last played on the station: {filepath: timestamp}."""
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    rows = conn.execute(
-        "SELECT filepath, MAX(played_at) FROM plays WHERE station = ? GROUP BY filepath", (station_id,)
-    ).fetchall()
-    conn.close()
-    return dict(rows)
+    with library_db() as conn:
+        return dict(conn.execute(
+            "SELECT filepath, MAX(played_at) FROM plays WHERE station = ? GROUP BY filepath", (station_id,)
+        ).fetchall())
 
 
 def track_cooldown_seconds(config, tracks):
@@ -492,7 +462,7 @@ def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT, model=None
 
     try:
         result = json.loads(body)
-    except Exception as e:
+    except ValueError:
         llm_log.warning(
             f"Response ({purpose}) is not JSON: HTTP {response.status_code} after {elapsed:.1f}s: "
             f"{_shorten(body)}"
@@ -613,23 +583,22 @@ def describe_artists(artists, config):
     in (e.g. "Eurobeat/..."), which tells the AI far more about an obscure
     artist than its name alone."""
     clause, params = track_filter_clause(config)
-    conn = sqlite3.connect(DB_FILE)
     lines = []
-    for artist in artists:
-        rows = conn.execute(f"""
-            SELECT filepath, title, year, genre FROM tracks
-            WHERE {clause} AND artist = ?
-            ORDER BY RANDOM() LIMIT 2
-        """, params + [artist]).fetchall()
-        if not rows:
-            lines.append(artist)
-            continue
-        titles = ", ".join(f'"{title}"' + (f" ({year})" if year else "") for _, title, year, _ in rows)
-        genres = sorted({genre for _, _, _, genre in rows if genre})
-        genre = f"; tagged genre: {'/'.join(genres)}" if genres else ""
-        folder = "/".join(os.path.dirname(rows[0][0]).split(os.sep)[-2:])
-        lines.append(f"{artist} (e.g. {titles}{genre}; folder: {folder})")
-    conn.close()
+    with library_db() as conn:
+        for artist in artists:
+            rows = conn.execute(f"""
+                SELECT filepath, title, year, genre FROM tracks
+                WHERE {clause} AND artist = ?
+                ORDER BY RANDOM() LIMIT 2
+            """, params + [artist]).fetchall()
+            if not rows:
+                lines.append(artist)
+                continue
+            titles = ", ".join(f'"{title}"' + (f" ({year})" if year else "") for _, title, year, _ in rows)
+            genres = sorted({genre for _, _, _, genre in rows if genre})
+            genre = f"; tagged genre: {'/'.join(genres)}" if genres else ""
+            folder = "/".join(os.path.dirname(rows[0][0]).split(os.sep)[-2:])
+            lines.append(f"{artist} (e.g. {titles}{genre}; folder: {folder})")
     return lines
 
 
@@ -773,6 +742,7 @@ async def generate_audio(text, output_file, voice):
     log.error("Couldn't synthesize the intro; the block goes on air without it.")
     return False
 
+
 def track_duration(path):
     """Playback duration of an audio file in seconds, or 0 if it can't be
     read (e.g. briefly missing/locked) rather than crashing the loop."""
@@ -803,11 +773,13 @@ def refresh_fallback_list(station_id):
     artists = [a for a in load_artist_roster(station_id)["allowed"] if a in playable]
     if not artists:
         return  # no roster yet; the first block builds it
-    tracks = []
-    for artist in random.sample(artists, min(len(artists), FALLBACK_TRACKS)):
-        track = get_track_by_artist(artist, config)
-        if track:
-            tracks.append(track[0])
+    tracks_by_artist = {}
+    for track_path, artist, _, _ in get_station_tracks(config):
+        tracks_by_artist.setdefault(artist, []).append(track_path)
+    tracks = [
+        random.choice(tracks_by_artist[artist])
+        for artist in random.sample(artists, min(len(artists), FALLBACK_TRACKS))
+    ]
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.writelines(f"{music_uri(track)}\n" for track in tracks)
@@ -858,8 +830,7 @@ def music_gain(path):
     """The gain (dB) that brings a track towards MUSIC_LOUDNESS_LUFS (see
     there), or None if it can't be measured. Measured once per track and
     kept in the library database."""
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    try:
+    with library_db() as conn:
         row = conn.execute("SELECT loudness, true_peak FROM tracks WHERE filepath = ?", (path,)).fetchone()
         if row and row[0] is not None:
             loudness, peak = row
@@ -870,9 +841,6 @@ def music_gain(path):
                 log.warning(f"Couldn't measure the loudness of {path}: {e}")
                 return None
             conn.execute("UPDATE tracks SET loudness = ?, true_peak = ? WHERE filepath = ?", (loudness, peak, path))
-            conn.commit()
-    finally:
-        conn.close()
     gain = MUSIC_LOUDNESS_LUFS - loudness
     if gain > 0:
         # Raise only as far as the peaks allow, but never lower a quiet
@@ -945,9 +913,8 @@ def program_subject_of(program):
     if program['mode'] == "artist":
         return lambda track: track[1]
     if program['group_by'] == "album":
-        conn = sqlite3.connect(DB_FILE)
-        albums = dict(conn.execute("SELECT filepath, album FROM tracks").fetchall())
-        conn.close()
+        with library_db() as conn:
+            albums = dict(conn.execute("SELECT filepath, album FROM tracks").fetchall())
         return lambda track: (albums.get(track[0]) or None) if albums.get(track[0]) != "Unknown Album" else None
     marker = f"/{program['folder_after'].strip('/')}/"
 
@@ -997,7 +964,7 @@ def choose_program_subject(station_id, program, slot_start, slot_end, tracks, su
     return subject
 
 
-async def run_subject_program_block(station_id, config, program, slot_start, slot_end, starts_at, dj_audio_file):
+async def run_subject_program_block(station_id, config, program, slot_start, slot_end, starts_at):
     """A block of an artist- or collection-mode program: songs of the
     episode's subject (an artist, or e.g. a game's soundtrack), none
     repeated within the episode, least recently played first where possible,
@@ -1038,14 +1005,13 @@ async def run_subject_program_block(station_id, config, program, slot_start, slo
         return None
 
     is_artist = program['mode'] == "artist"
-    conn = sqlite3.connect(DB_FILE)
     details = []
-    for path, artist, title, _ in selected:
-        album, year = conn.execute("SELECT album, year FROM tracks WHERE filepath = ?", (path,)).fetchone()
-        details.append(f'"{title}"' + ("" if is_artist else f" by {artist}")
-                       + (f", album: {album}" if album and album != "Unknown Album" else "")
-                       + (f", {year}" if year else ""))
-    conn.close()
+    with library_db() as conn:
+        for path, artist, title, _ in selected:
+            album, year = conn.execute("SELECT album, year FROM tracks WHERE filepath = ?", (path,)).fetchone()
+            details.append(f'"{title}"' + ("" if is_artist else f" by {artist}")
+                           + (f", album: {album}" if album and album != "Unknown Album" else "")
+                           + (f", {year}" if year else ""))
     if is_artist:
         about = subject
     else:
@@ -1128,7 +1094,7 @@ async def run_station(station_id, starts_at=None):
     starts_at = starts_at or datetime.datetime.now()
     active = programs.current_program(config, starts_at)
     if active and active[0]['mode'] in ("artist", "collection"):
-        program_block = await run_subject_program_block(station_id, config, *active, starts_at, dj_audio_file)
+        program_block = await run_subject_program_block(station_id, config, *active, starts_at)
         if program_block:
             selected_tracks, dj_text = program_block
             return await finish_block(config, selected_tracks, dj_text, dj_audio_file)
@@ -1277,14 +1243,14 @@ def fill_missing_track_info(station_id):
         return
     allowed = set(load_artist_roster(station_id)["allowed"])
     clause, params = track_filter_clause(config, use_years=False)
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    rows = [
-        row for row in conn.execute(f"""
-            SELECT filepath, artist, title, album FROM tracks
-            WHERE {clause} AND (year IS NULL OR genre IS NULL) AND ai_info_checked = 0
-        """, params).fetchall()
-        if row[1] in allowed
-    ]
+    with library_db() as conn:
+        rows = [
+            row for row in conn.execute(f"""
+                SELECT filepath, artist, title, album FROM tracks
+                WHERE {clause} AND (year IS NULL OR genre IS NULL) AND ai_info_checked = 0
+            """, params).fetchall()
+            if row[1] in allowed
+        ]
     if rows:
         log.info(f"Asking AI for the release year/genre of {len(rows)} track(s) missing them in their tags...")
     current_year = time.localtime().tm_year
@@ -1322,16 +1288,15 @@ def fill_missing_track_info(station_id):
         except Exception as e:
             log.warning(f"Couldn't get track info for {len(batch)} track(s) ({e}); will retry next time.")
             continue
-        for i, (path, _, _, _) in enumerate(batch, 1):
-            year, genre = answers.get(i, (None, None))
-            filled += year is not None
-            conn.execute(
-                "UPDATE tracks SET year = COALESCE(year, ?), genre = COALESCE(genre, ?), ai_info_checked = 1 "
-                "WHERE filepath = ?",
-                (year, genre, path),
-            )
-        conn.commit()
-    conn.close()
+        with library_db() as conn:
+            for i, (path, _, _, _) in enumerate(batch, 1):
+                year, genre = answers.get(i, (None, None))
+                filled += year is not None
+                conn.execute(
+                    "UPDATE tracks SET year = COALESCE(year, ?), genre = COALESCE(genre, ?), ai_info_checked = 1 "
+                    "WHERE filepath = ?",
+                    (year, genre, path),
+                )
     if rows:
         log.info(f"AI filled in the release year of {filled} of {len(rows)} track(s).")
 
@@ -1372,18 +1337,21 @@ def get_news_stories(settings, language, hour):
         for hours_ago in range(1, settings['avoid_repeat_hours'] + 1):
             earlier = hour - datetime.timedelta(hours=hours_ago)
             for path in glob.glob(os.path.join(NEWS_CACHE_DIR, f"{earlier:%Y%m%d-%H}-{history}-*.json")):
-                with open(path, encoding="utf-8") as f:
-                    recent.extend(json.load(f))
+                recent.extend(read_json(path, []))
         stories = news.build_stories(settings, language, ask_json, recent)
-        with open(base + ".json.tmp", "w", encoding="utf-8") as f:
-            json.dump(stories, f, ensure_ascii=False, indent=1)
-        os.replace(base + ".json.tmp", base + ".json")
+        write_json(base + ".json", stories, indent=1)
     # Drop other hours' stories (and locks) older than a day.
     for name in os.listdir(NEWS_CACHE_DIR):
         path = os.path.join(NEWS_CACHE_DIR, name)
         if time.time() - os.path.getmtime(path) > 86400:
             os.remove(path)
     return stories
+
+
+async def loop_run(func, *args):
+    """Runs a blocking function in the default executor, so the agent's
+    other tasks (news, library scans, feeding the player) carry on."""
+    return await asyncio.get_running_loop().run_in_executor(None, func, *args)
 
 
 def news_queued_marker(station_id, hour):
@@ -1395,11 +1363,8 @@ def news_queued_marker(station_id, hour):
 async def prepare_news_segment(station_id, config, settings, hour):
     """Writes and synthesizes the news segment for `hour` (a datetime on the
     hour). Returns the audio file's path, or None if it couldn't be made."""
-    loop = asyncio.get_event_loop()
     try:
-        stories = await loop.run_in_executor(
-            None, get_news_stories, settings, station_language(config), hour
-        )
+        stories = await loop_run(get_news_stories, settings, station_language(config), hour)
     except Exception as e:
         log.error(f"Couldn't prepare the {hour:%H:%M} news: {e}")
         return None
@@ -1471,11 +1436,6 @@ async def news_loop(station_id):
         await asyncio.sleep(max(1.0, (next_hour - datetime.datetime.now()).total_seconds() + 1))
 
 
-async def loop_run(func, *args):
-    """Runs a blocking function in the default executor."""
-    return await asyncio.get_event_loop().run_in_executor(None, func, *args)
-
-
 def run_scanner_once():
     """Runs scanner.py to (re)index the music library. Several stations may
     each run their own --loop process against the same music_library.db;
@@ -1497,12 +1457,11 @@ async def scanner_loop(station_id):
     """Scans once immediately, then every SCAN_INTERVAL_HOURS (if > 0), each
     time followed by classifying new artists into the station's roster and
     filling in missing track info the station needs."""
-    loop = asyncio.get_event_loop()
     while True:
-        await loop.run_in_executor(None, run_scanner_once)
+        await loop_run(run_scanner_once)
         for task in (refresh_roster, fill_missing_track_info):
             try:
-                await loop.run_in_executor(None, task, station_id)
+                await loop_run(task, station_id)
             except Exception:
                 log.exception(f"Background task {task.__name__} failed")
         if SCAN_INTERVAL_HOURS <= 0:
@@ -1518,14 +1477,13 @@ async def feed_player(station_id):
     long the AI takes; if it takes longer than what's left, radio.liq bridges
     the gap with tracks from the fallback list."""
     player = Liquidsoap(get_socket_file(station_id))
-    loop = asyncio.get_event_loop()
     durations = {}  # file path -> seconds, cached while the files are queued
     unreachable_since = None
 
     while True:
         try:
-            await loop.run_in_executor(None, refresh_fallback_list, station_id)
-            state = await loop.run_in_executor(None, QueueState, player, durations)
+            await loop_run(refresh_fallback_list, station_id)
+            state = await loop_run(QueueState, player, durations)
         except OSError as e:
             if unreachable_since is None:
                 unreachable_since = time.time()
@@ -1558,7 +1516,7 @@ async def feed_player(station_id):
             continue
         try:
             station_name = load_station_config(station_id)['name']
-            gains = await loop.run_in_executor(None, queue_block, player, files, station_name)
+            gains = await loop_run(queue_block, player, files, station_name)
             log.info(f"Queued the block ({len(files)} files; song gains {', '.join(gains)} dB).")
         except OSError as e:
             log.error(f"Couldn't queue the block, Liquidsoap unreachable ({e}); it will be regenerated.")

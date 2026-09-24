@@ -249,9 +249,7 @@ Everything a station generates at runtime lives in its own folder,
 | `logs/` | The station's [logs](#logs) |
 
 Shared files (`stations.json`, `music_library.db`, `.env`) stay in the
-project root. Files left in the project root by older versions
-(`artists_<station_id>.json` etc.) are moved into the station's folder
-automatically the next time `dj_agent.py` starts for that station.
+project root.
 
 ### Logs
 
