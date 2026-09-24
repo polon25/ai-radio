@@ -17,15 +17,15 @@ station is just an entry in `stations.json` plus a running pair of processes.
 
 ```
 scanner.py          → indexes a music folder into music_library.db
-dj_agent.py --loop   → repeatedly: picks artists (via AI), fetches one track
-                        per artist, writes a DJ intro (AI text → Edge TTS
-                        audio), and queues the block in Liquidsoap; during a
-                        program's slot, follows the program's rules instead;
-                        before every hour, prepares the news bulletin
-radio.liq             → plays the queued blocks (and news) and streams them
-                        to Icecast
-web_server.py         → the listeners' web page: players, what's on, what
-                        played (one for all stations)
+dj_agent.py --loop  → repeatedly: picks artists (via AI), fetches one track
+                      per artist, writes a DJ intro (AI text → Edge TTS
+                      audio), and queues the block in Liquidsoap; during a
+                      program's slot, follows the program's rules instead;
+                      before every hour, prepares the news bulletin
+radio.liq           → plays the queued blocks (and news) and streams them
+                      to Icecast
+web_server.py       → the listeners' web page: players, what's on, what
+                      played (one for all stations)
 ```
 
 `dj_agent.py --loop` and `radio.liq` run as two independent, long-lived
@@ -75,9 +75,9 @@ is classified three times — `openrouter/free` picks a different model each
 time, and their answers vary a lot (one picks exactly the right artists,
 the next half the list) — and an artist gets in only if most answers picked
 it. Artists in a batch with fewer than two usable answers are left
-unclassified and asked about again next time. The `roster_prompt` should ask the AI to be strict — a
-lenient "include anything that reasonably fits" lets whole neighbouring
-genres in.
+unclassified and asked about again next time. The `roster_prompt` should
+ask the AI to be strict — a lenient "include anything that reasonably
+fits" lets whole neighbouring genres in.
 
 To reclassify a station's whole roster (e.g. after changing its
 `roster_prompt` or description), run
@@ -88,10 +88,12 @@ To reclassify a station's whole roster (e.g. after changing its
 
 with the station's agent stopped (so it can't save the roster at the same
 time). The station keeps playing from Liquidsoap's queue meanwhile; start
-the agent again when it's done. A block
-that falls back to a random pick (AI request failed) still draws only from
-`allowed`, so it always stays on-theme. You can hand-edit either list at any
-time — an artist you add to `banned` is never asked about again.
+the agent again when it's done.
+
+A block that falls back to a random pick (AI request failed) still draws
+only from `allowed`, so it always stays on-theme. You can hand-edit either
+list at any time — an artist you add to `banned` is never asked about
+again.
 
 AI classification is optional — set `"use_ai_roster": false` on a station and
 every artist under its `folder_filter` becomes `allowed`, no AI call
@@ -123,8 +125,8 @@ disable it entirely.
 ### Track cooldown
 
 Every track a station starts playing is recorded in a `plays` table in
-`music_library.db` (fallback tracks included, DJ intros not; entries older
-than 30 days are dropped). When a block is prepared:
+`music_library.db` (fallback tracks included, DJ intros and news not;
+entries older than 30 days are dropped). When a block is prepared:
 
 - artists all of whose tracks played on this station within the track
   cooldown aren't offered to the AI (so an artist with a single track in
@@ -232,6 +234,23 @@ Each episode's state (its artist, blocks so far, what the DJ said) is kept
 in `stations/<station_id>/programs/`, so a restarted agent carries on with
 the same episode.
 
+### Source files
+
+| File | What it does |
+|---|---|
+| `dj_agent.py` | A station's agent: prepares and queues blocks (roster, cooldowns, programs), schedules the news, runs library scans |
+| `llm.py` | OpenRouter requests for JSON answers, with retries and preferred/rejected models |
+| `audio.py` | The DJ's speech (Edge TTS, levelled to match the music); tracks' length and loudness |
+| `news.py` | News bulletins: headlines, picking and writing the stories |
+| `programs.py` | Program schedules and episode state |
+| `scanner.py` | Indexes the music library |
+| `radio.liq` | Liquidsoap: plays the queues and streams to Icecast |
+| `liquidsoap_client.py` | Talks to `radio.liq`'s command socket |
+| `radio_log.py` | Daily log files; forwards Liquidsoap's log into them |
+| `stream_info.py` | A station's stream details, for `radio.liq` |
+| `web_server.py`, `web/` | The [web page](#web-page) |
+| `systemd/` | Service units (see [Running at boot](#running-at-boot-systemd)) |
+
 ### Station files
 
 Everything a station generates at runtime lives in its own folder,
@@ -335,8 +354,8 @@ mounted) is then more likely than the music being deleted.
 
    `dj_agent.py --loop` re-scans automatically (see [Library
    scanning](#library-scanning)), so this manual run is mainly for seeding
-   the database before the first `--loop` start, or for `dj_agent.py`'s
-   one-shot mode.
+   the database before the first `--loop` start, or before trying a station
+   out with a [single block](#running).
 
 5. **Icecast** — besides the passwords (the source password goes in `.env`
    as `ICECAST_PASSWORD`), set the mounts' character set to UTF-8, inside
@@ -469,10 +488,19 @@ keyed by station ID:
 Each station needs both processes running, e.g. for `ciezki_mlot`:
 
 ```bash
-export $(grep -v '^#' .env | xargs)   # or set STATION_ID=ciezki_mlot directly
-liquidsoap radio.liq &
+set -a; . ./.env; set +a       # Icecast settings, for radio.liq
+STATION_ID=ciezki_mlot liquidsoap radio.liq &
 ./venv/bin/python dj_agent.py ciezki_mlot --loop &
 ```
+
+`dj_agent.py <station_id>` takes one of:
+
+| Option | What it does |
+|---|---|
+| `--loop` | Runs the station: keeps Liquidsoap's queue topped up, airs the news, rescans the library (what the systemd unit runs) |
+| (none) | Prepares a single block and queues it if Liquidsoap is running, e.g. to try out a station's prompts |
+| `--rebuild-roster` | Reclassifies every artist into the station's roster (see [Artist roster](#artist-roster)) |
+| `--news-now` | Prepares this hour's news bulletin and queues it right away (see [News](#news)) |
 
 ### Running at boot (systemd)
 
@@ -530,10 +558,18 @@ Settings (in `.env`):
 
 ## Adding a new station
 
-1. Add an entry to `stations.json` (copy `ciezki_mlot`'s shape).
-2. Pick a `folder_filter` that scopes it to the right part of your library.
-3. Run it once manually to build its artist roster and confirm the prompts
-   produce sensible output, then enable the two systemd services for it.
+1. Add an entry to `stations.json` (copy `ciezki_mlot`'s shape from
+   `stations.json.example`), with a `folder_filter` that scopes it to the
+   right part of your library.
+2. Build its artist roster with `dj_agent.py <station_id> --rebuild-roster`
+   and look through `stations/<station_id>/artists.json` (move artists
+   between `allowed` and `banned` by hand if needed). Without this step the
+   agent builds it in the background anyway, but plays from the whole
+   library until then.
+3. Optionally, try the prompts out by preparing a single block (see
+   [Running](#running)).
+4. Enable the station's two systemd services. Its Icecast mount
+   (`/<station_id>`) and its place on the web page follow automatically.
 
 ## Why a request queue
 
