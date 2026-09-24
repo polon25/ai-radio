@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import news
+import programs
 import scanner
 from liquidsoap_client import NEWS_QUEUE_ID, Liquidsoap
 from radio_log import (
@@ -572,7 +573,7 @@ def pick_by_indices(indices, candidates, purpose):
     return picked
 
 
-def curate_artists_and_script(artists, prompt_template, station_name, description, song_count):
+def curate_artists_and_script(artists, prompt_template, station_name, description, song_count, models=()):
     """Asks the AI to pick `song_count` artists for the next block and write
     the DJ intro."""
     prompt = prompt_template.format(
@@ -595,7 +596,7 @@ def curate_artists_and_script(artists, prompt_template, station_name, descriptio
             llm_log.warning(f"Asked for {song_count} artist(s), AI picked {len(selected)} valid one(s)")
         return selected[:song_count], script.strip()
 
-    return ask_llm_json(prompt, "curation", validate)
+    return ask_llm_json(prompt, "curation", validate, models=models)
 
 
 def describe_artists(artists, config):
@@ -896,11 +897,195 @@ def queue_block(player, files, station_name):
     return gains
 
 
-async def run_station(station_id):
-    """Generates one block for a station. Returns the absolute paths of its
-    audio files in play order (intro first), or None if it couldn't."""
+def _escape_braces(text):
+    return str(text).replace("{", "{{").replace("}", "}}")
+
+
+# Rough length of a DJ intro, for guessing whether a program block ends
+# after its slot does (and should close the episode) before it's written.
+DJ_INTRO_SECONDS_GUESS = 30
+
+
+def program_position(episode, starts_at, block_seconds, slot_end):
+    """Where a program block falls in its episode, as an instruction for
+    the DJ: opening it, closing it (if it's expected to end after the slot
+    does, so no program block follows it), or somewhere in between."""
+    if not episode.get("blocks"):
+        return ("This is the start of the episode: welcome the listeners to the station, announce the "
+                "program by its name, and say what today's episode is about.")
+    if starts_at + datetime.timedelta(seconds=block_seconds + DJ_INTRO_SECONDS_GUESS) >= slot_end:
+        return ("This is the episode's last part: introduce the songs, then mention that this is the last "
+                "part of today's program and thank the listeners.")
+    return "The episode is under way (don't welcome the listeners or announce the program again)."
+
+
+def choose_program_artist(station_id, program, slot_start, slot_end, tracks, episodes):
+    """Picks the artist of a new artist-mode episode: one with at least
+    min_minutes (default: the slot's length) of music the station may play,
+    from the program's `artists` or else the station's roster, leaving out
+    `exclude_artists` and, if possible, the artists of the last
+    repeat_after_episodes episodes. None if no artist has enough music."""
+    minutes = {}
+    for _, artist, _, duration in tracks:
+        minutes[artist] = minutes.get(artist, 0) + (duration or 0) / 60
+    needed = program["min_minutes"] or (slot_end - slot_start).total_seconds() / 60
+    pool = program["artists"] or load_artist_roster(station_id)["allowed"] or list(minutes)
+    excluded = set(program["exclude_artists"])
+    candidates = [a for a in pool if a not in excluded and minutes.get(a, 0) >= needed]
+    recent = set(episodes.recent_artists(program["repeat_after_episodes"]))
+    fresh = [a for a in candidates if a not in recent]
+    if not candidates:
+        log.warning(f"Program '{program['id']}': no artist has {needed:.0f} min of music; playing as usual.")
+        return None
+    artist = random.choice(fresh or candidates)
+    log.info(
+        f"Program '{program['title']}': today's artist is {artist} ({minutes[artist]:.0f} min of music; "
+        f"picked from {len(fresh or candidates)} artist(s) with enough).",
+        extra=SUMMARY,
+    )
+    return artist
+
+
+async def run_artist_program_block(station_id, config, program, slot_start, slot_end, starts_at, dj_audio_file):
+    """A block of an artist-mode program: songs by the episode's artist
+    (none repeated within the episode, least recently played first where
+    possible) and a DJ bit about the artist, their albums or the songs.
+    Returns (tracks, DJ text), or None if the program can't run."""
+    song_count = program.get('songs_per_block') or config.get('songs_per_block', DEFAULT_SONGS_PER_BLOCK)
+    episodes = programs.Episodes(get_station_dir(station_id), program['id'])
+    tracks = get_station_tracks(config)
+    episode = episodes.get(slot_start)
+    if episode is None:
+        artist = choose_program_artist(station_id, program, slot_start, slot_end, tracks, episodes)
+        if not artist:
+            return None
+        episode = episodes.start(slot_start, artist=artist, said=[], tracks=[])
+    artist = episode['artist']
+
+    # Songs: not yet picked in this episode (the episode keeps its own list:
+    # a song queued a moment ago isn't in the play history yet), preferring
+    # ones that haven't played for a while; if the episode runs out, repeats
+    # are allowed.
+    last_plays = get_last_plays(station_id)
+    artist_tracks = [t for t in tracks if t[1] == artist]
+    picked_before = set(episode.get('tracks', []))
+    unplayed = [
+        t for t in artist_tracks
+        if t[0] not in picked_before and last_plays.get(t[0], 0) < slot_start.timestamp()
+    ] or artist_tracks
+    cutoff = time.time() - track_cooldown_seconds(config, tracks)
+    fresh = [t for t in unplayed if last_plays.get(t[0], 0) < cutoff]
+    stale = [t for t in unplayed if t not in fresh]
+    random.shuffle(fresh)
+    stale.sort(key=lambda t: last_plays.get(t[0], 0))
+    selected = (fresh + stale)[:song_count]
+    if not selected:
+        log.error(f"Program '{program['id']}': no track by {artist} to play.")
+        return None
+
+    conn = sqlite3.connect(DB_FILE)
+    details = []
+    for path, _, title, _ in selected:
+        album, year = conn.execute("SELECT album, year FROM tracks WHERE filepath = ?", (path,)).fetchone()
+        details.append(f'"{title}"' + (f", album: {album}" if album and album != "Unknown Album" else "")
+                       + (f", {year}" if year else ""))
+    conn.close()
+    position = program_position(episode, starts_at, sum(t[3] or 0 for t in selected), slot_end)
+    said = "\n".join(f"- {text}" for text in episode.get('said', [])[-6:])
+    titles = {t[0]: t[2] for t in artist_tracks}
+    played = ", ".join(f'"{titles[path]}"' for path in episode.get('tracks', []) if path in titles)
+    prompt = (
+        f"You are the DJ of the radio station \"{config['name']}\" ({config['description']}), presenting its "
+        f"recurring program \"{program['title']}\". Today's episode is all about {artist}.\n"
+        + (f"Program instructions: {program['instructions']}\n" if program['instructions'] else "")
+        + f"{position}\n"
+        + (f"Already played earlier in this episode: {played}.\n" if played else "")
+        + (f"What you already said earlier in this episode:\n{said}\nDon't repeat any of those facts, "
+           f"albums or songs: pick a new angle this time (another album, a collaboration, a story behind "
+           f"one of the next songs, the artist's influences or influence...).\n" if said else "")
+        + "The next songs, in order:\n" + "\n".join(f"{i}. {d}" for i, d in enumerate(details, 1)) + "\n\n"
+        f"Write what you say before these songs, in the language of locale {station_language(config)} "
+        f"(e.g. Polish for pl-PL), about 60-130 words: share something interesting about {artist}, their "
+        f"albums or these songs, then introduce the songs. Only state facts you're confident are true; if "
+        f"you don't know much about the artist, talk about the songs and albums listed instead of making "
+        f"anything up. Always refer to the station by its exact name. Plain spoken sentences, no emojis, "
+        f"asterisks or hashtags."
+        + "\n\nYou MUST respond strictly in valid JSON format with no markdown formatting around it, "
+        'structured like this:\n{"dj_script": "..."}'
+    )
+
+    def validate(parsed):
+        script = parsed.get("dj_script")
+        if not isinstance(script, str) or not script.strip():
+            raise KeyError("AI response lacks 'dj_script'.")
+        return script.strip()
+
+    try:
+        dj_text = ask_llm_json(prompt, "program", validate, models=program['models'])
+    except Exception as e:
+        log.warning(f"Couldn't write the program's DJ script ({e}); using the fallback script.")
+        dj_text = (program['fallback_script'] or config.get('fallback_script', "")).format(
+            station_name=config['name'], title=program['title'], artist=artist)
+    episode['blocks'] += 1
+    episode['said'] = (episode.get('said', []) + [dj_text])[-12:]
+    episode['tracks'] = episode.get('tracks', []) + [t[0] for t in selected]
+    episodes.save()
+    save_recent_artists(station_id, load_recent_artists(station_id) + [artist] * len(selected))
+    log.info(f"Program '{program['title']}' block {episode['blocks']} ({artist})", extra=SUMMARY)
+    return [t[:3] for t in selected], dj_text
+
+
+def theme_program_prompt(config, program, episode, starts_at, slot_end):
+    """The block prompt for a theme-mode program: like the station's own,
+    but picking artists for the program's theme, with its instructions and
+    the block's place in the episode (assuming a block of ~12 minutes)."""
+    position = program_position(episode, starts_at, 12 * 60, slot_end)
+    return (
+        f"You are the DJ of the radio station \"{{station_name}}\", presenting its recurring program "
+        f"\"{_escape_braces(program['title'])}\", about: {{description}}.\n"
+        + (f"Program instructions: {_escape_braces(program['instructions'])}\n" if program['instructions'] else "")
+        + f"{position}\n"
+        "Here is a pool of available musical artists from the library:\n{artists_list}\n\n"
+        "Your task:\n1. Select EXACTLY {song_count} artists from the list above that best fit the program's "
+        "theme. Ignore any that don't fit.\n"
+        f"2. Write the DJ script said before their songs, in the language of locale {station_language(config)} "
+        "(e.g. Polish for pl-PL), about 60-130 words, introducing the artists and relating them to the "
+        "program's theme. Always refer to the station by its exact name, \"{station_name}\". Only state facts "
+        "you're confident are true. Do not use emojis, asterisks, or hashtags.\n\n"
+        "You MUST respond strictly in valid JSON format with no markdown formatting around it, structured "
+        'like this:\n{{\n  "selected_indices": [1, 5, 12],\n  "dj_script": "Your generated intro text here..."\n}}'
+    )
+
+
+async def run_station(station_id, starts_at=None):
+    """Generates one block for a station, which is expected to start playing
+    at `starts_at` (default: now); a block starting within one of the
+    station's programs follows that program's rules. Returns the absolute
+    paths of its audio files in play order (intro first), or None if it
+    couldn't."""
     config = load_station_config(station_id)
     dj_audio_file = new_intro_audio_file(station_id)
+    starts_at = starts_at or datetime.datetime.now()
+    active = programs.current_program(config, starts_at)
+    if active and active[0]['mode'] == "artist":
+        program_block = await run_artist_program_block(station_id, config, *active, starts_at, dj_audio_file)
+        if program_block:
+            selected_tracks, dj_text = program_block
+            return await finish_block(config, selected_tracks, dj_text, dj_audio_file)
+    theme_episode = None
+    models = ()
+    if active and active[0]['mode'] == "theme":
+        program, slot_start, slot_end = active
+        theme_episodes = programs.Episodes(get_station_dir(station_id), program['id'])
+        theme_episode = theme_episodes.get(slot_start) or theme_episodes.start(slot_start)
+        config = dict(
+            config,
+            prompt=theme_program_prompt(config, program, theme_episode, starts_at, slot_end),
+            description=program['theme'] or config['description'],
+            songs_per_block=program.get('songs_per_block') or config.get('songs_per_block'),
+        )
+        models = program['models']
+        log.info(f"Program '{program['title']}' block {theme_episode['blocks'] + 1} (theme)", extra=SUMMARY)
     song_count = config.get('songs_per_block', DEFAULT_SONGS_PER_BLOCK)
 
     # 1. Load this station's artist roster. New artists get classified in
@@ -975,7 +1160,7 @@ async def run_station(station_id):
     # 3. Ask AI to pick best artists and write intro using prompt from config
     try:
         selected_artists, dj_text = curate_artists_and_script(
-            artists_pool, config['prompt'], config['name'], config['description'], song_count
+            artists_pool, config['prompt'], config['name'], config['description'], song_count, models
         )
     except Exception as e:
         log.warning(f"Error during AI curation: {e}. Falling back to random selection and the fallback script.")
@@ -1002,6 +1187,14 @@ async def run_station(station_id):
         log.error("Could not retrieve tracks for selected artists.")
         return
 
+    if theme_episode is not None:
+        theme_episode['blocks'] += 1
+        theme_episodes.save()
+    return await finish_block(config, selected_tracks, dj_text, dj_audio_file)
+
+
+async def finish_block(config, selected_tracks, dj_text, dj_audio_file):
+    """Synthesizes a block's DJ script and returns its files (intro first)."""
     intro = [os.path.abspath(dj_audio_file)] if await generate_audio(dj_text, dj_audio_file, config['voice']) else []
     files = intro + [track[0] for track in selected_tracks]
     log.info(
@@ -1291,7 +1484,8 @@ async def feed_player(station_id):
             "preparing the next block."
         )
         try:
-            files = await run_station(station_id)
+            starts_at = datetime.datetime.now() + datetime.timedelta(seconds=state.seconds_left)
+            files = await run_station(station_id, starts_at)
         except Exception:
             # Anything unexpected (a library or network error...) shouldn't
             # take the whole agent down; Liquidsoap keeps playing meanwhile.

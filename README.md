@@ -185,6 +185,37 @@ station's name in the intro and its voice differ. `dj_agent.py <station_id>
 the settings out. See [Configuring a station](#configuring-a-station) for
 the settings.
 
+### Programs
+
+A station can have recurring programs: time slots (e.g. Mondays 12:00-13:00)
+in which its blocks follow the program's rules instead of the usual ones.
+Whether a block belongs to a program is decided by when it's expected to
+start playing, so a program starts with the first block after its slot
+opens and ends with the last one starting before it closes. Programs don't
+change the news: it still plays around the top of the hour, between blocks
+(so a program at 12:00 effectively starts after the 12:00 news).
+
+Two kinds (`mode`):
+
+- `artist` — each episode is about one artist, picked when it starts: at
+  random from the program's `artists` (or else the station's roster), among
+  those with at least `min_minutes` of music the station may play (default:
+  the slot's length), leaving out `exclude_artists` and, if possible, the
+  artists of the last `repeat_after_episodes` episodes. Its blocks play that
+  artist's songs (none twice in an episode, least recently played first).
+  The DJ opens the episode (welcoming the listeners, announcing the program
+  and the artist, with a short introduction), shares something about the
+  artist, their albums or the songs before each later block — given the
+  songs' albums and years from the library, and what was already said in
+  the episode, so as not to repeat it — and closes the last block.
+- `theme` — each block is picked by the AI from the station's roster to fit
+  the program's `theme` (e.g. "power ballads of the 80s"), with the program's
+  instructions for the DJ; the station's cooldowns still apply.
+
+Each episode's state (its artist, blocks so far, what the DJ said) is kept
+in `stations/<station_id>/programs/`, so a restarted agent carries on with
+the same episode.
+
 ### Station files
 
 Everything a station generates at runtime lives in its own folder,
@@ -194,6 +225,7 @@ Everything a station generates at runtime lives in its own folder,
 |---|---|
 | `intros/` | Generated DJ intros, one per block (the newest few are kept) |
 | `news/` | Generated news segments (the newest few are kept) |
+| `programs/` | Each program's episodes (see [Programs](#programs)) |
 | `fallback.txt` | Tracks `radio.liq` plays if the block queue runs dry |
 | `liquidsoap.sock` | Liquidsoap's command socket, used by `dj_agent.py` |
 | `artists.json` | The [artist roster](#artist-roster) |
@@ -356,6 +388,24 @@ keyed by station ID:
     one-sentence summaries, one after another). They default to English.
   The news is written in the language of the station's `voice` (e.g. Polish
   for `pl-PL-...`).
+- `programs` — recurring programs (see [Programs](#programs)), a list of:
+  - `id` — identifies the program (and its episodes' file); keep it stable.
+  - `title` — its name, as the DJ announces it.
+  - `schedule` — its slots, e.g. `[{"days": ["mon"], "start": "12:00",
+    "end": "13:00"}]`; `days` are `mon`...`sun` or `"daily"` (the default);
+    a slot ending before it starts runs past midnight.
+  - `mode` — `"artist"` (default) or `"theme"`.
+  - `instructions` — free-text instructions for the DJ (tone, what to talk
+    about), in any language.
+  - `songs_per_block` — songs between the DJ's words (default: the
+    station's).
+  - `theme` — theme mode: what the program plays.
+  - `artists`, `exclude_artists`, `min_minutes`, `repeat_after_episodes`
+    (default 8) — artist mode: which artists may be picked (see above).
+  - `models` — preferred OpenRouter models for the DJ's words, as for news.
+  - `fallback_script` — said if the AI can't write the DJ's words; can use
+    `{station_name}`, `{title}` and `{artist}`.
+  The DJ speaks the language of the station's `voice`.
 - `roster_prompt` and `prompt` must each produce raw JSON with a
   `selected_indices` field (`prompt` additionally needs `dj_script`); see the
   `ciezki_mlot` entry for the exact contract each is held to. `prompt` can use

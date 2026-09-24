@@ -35,7 +35,48 @@
       "title": "News",
       "intro": "It's {hour}:00 on {station_name}. Here's what's in the news: {topics}",
       "outro": "That's all the news for now. Back to the music."
-    }
+    },
+    "programs": [
+      {
+        "id": "artist_monday",
+        "title": "Artist Monday",
+        "schedule": [
+          {
+            "days": [
+              "mon"
+            ],
+            "start": "12:00",
+            "end": "13:00"
+          }
+        ],
+        "mode": "artist",
+        "instructions": "Talk like a passionate fan: share facts about the artist's history, albums and songs.",
+        "exclude_artists": [],
+        "repeat_after_episodes": 8,
+        "models": [
+          "google/gemma-4-31b-it:free",
+          "nvidia/nemotron-3-ultra-550b-a55b:free"
+        ],
+        "fallback_script": "This is {title} on {station_name}. Today we're listening to {artist}."
+      },
+      {
+        "id": "ballads_evening",
+        "title": "Ballads at Nine",
+        "schedule": [
+          {
+            "days": [
+              "fri",
+              "sat"
+            ],
+            "start": "21:00",
+            "end": "22:00"
+          }
+        ],
+        "mode": "theme",
+        "theme": "slow, emotional ballads",
+        "instructions": "Keep a calm, late-evening tone."
+      }
+    ]
   },
   "another_example_dedicated_folder": {
     "name": "Dedicated Folder FM",
