@@ -284,6 +284,12 @@ A scan only opens files it doesn't know yet, plus files indexed by an older
 version of the scanner that didn't read everything it reads now (e.g. track
 lengths, years, genres), so rescans stay cheap.
 
+Tracks whose files are gone (deleted, or moved — a moved file is simply
+added again under its new path) are removed from the library. If that
+would be more than half of it, the scan leaves them be and logs a warning
+instead, since the music folder being unavailable (e.g. a drive that isn't
+mounted) is then more likely than the music being deleted.
+
 ## Setup
 
 1. **Python environment**

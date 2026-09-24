@@ -1,11 +1,18 @@
+"""Indexes the music library (MUSIC_FOLDER) into music_library.db: each
+track's tags, length, release year and genre. dj_agent.py --loop runs it
+periodically; see README, "Library scanning".
+"""
+
 import datetime
 import fcntl
 import logging
 import os
 import re
 import sqlite3
-from mutagen import File # Universal File reader (instead of format-specific EasyID3), so it handles mp3/flac/ogg/etc. uniformly
+
 from dotenv import load_dotenv
+# mutagen's generic File reader handles mp3/flac/ogg/... alike.
+from mutagen import File
 
 # Load environment variables from .env file
 load_dotenv()
@@ -43,6 +50,10 @@ ADDED_COLUMNS = [
 # Commit every this many tracks, so a long (re)scan never holds the database
 # for long.
 COMMIT_EVERY = 200
+# Tracks whose files are gone are removed from the library, unless that's
+# more than this share of it: then the music folder is more likely missing
+# (e.g. a drive not mounted) than the music deleted.
+MAX_REMOVED_SHARE = 0.5
 
 
 def create_database():
@@ -111,13 +122,15 @@ def scan_folder(conn):
         log.error(f"Folder '{MUSIC_FOLDER}' does not exist. Check your .env file.")
         return
 
-    known = {row[0]: row[1] for row in conn.execute("SELECT filepath, scan_version FROM tracks")}
+    known = dict(conn.execute("SELECT filepath, scan_version FROM tracks"))
+    found = set()
 
-    for root, dirs, files in os.walk(MUSIC_FOLDER):
+    for root, _, files in os.walk(MUSIC_FOLDER):
         for file in files:
             if not file.lower().endswith(SUPPORTED_FORMATS):
                 continue
             filepath = os.path.join(root, file)
+            found.add(filepath)
             if known.get(filepath, 0) >= SCAN_VERSION:
                 continue
             try:
@@ -144,10 +157,32 @@ def scan_folder(conn):
                 conn.commit()
 
     conn.commit()
+    removed_count = remove_missing(conn, [path for path in known if path not in found])
     log.info(
-        f"Done! Added {added_count} new tracks to the database, re-read {updated_count}.",
+        f"Done! Added {added_count} new tracks to the database, re-read {updated_count}, "
+        f"removed {removed_count}.",
         extra=SUMMARY,
     )
+
+
+def remove_missing(conn, candidates):
+    """Removes tracks whose files no longer exist (deleted or moved; a moved
+    file was just added under its new path) and returns how many."""
+    missing = [path for path in candidates if not os.path.exists(path)]
+    if not missing:
+        return 0
+    total = conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+    if len(missing) > MAX_REMOVED_SHARE * total:
+        log.warning(
+            f"{len(missing)} of {total} tracks' files are missing; not removing them from the library, "
+            f"in case the music folder is just unavailable. Is it mounted?"
+        )
+        return 0
+    conn.executemany("DELETE FROM tracks WHERE filepath = ?", [(path,) for path in missing])
+    conn.commit()
+    for path in missing[:20]:
+        log.info(f"Removed from the library (file gone): {path}")
+    return len(missing)
 
 
 if __name__ == "__main__":
