@@ -434,9 +434,10 @@ keyed by station ID:
     "economy"]`.
   - `story_minutes` — roughly how long each story is read for (default 2).
   - `avoid_repeat_hours` — how many previous hours' bulletins a story isn't
-    repeated from, unless there's news in it (default 12, at most 72).
-    Older stories are left out by `max_age_hours` anyway, so there's little
-    point in making it longer than that, just a longer prompt.
+    repeated from, unless there's news in it (default 4, at most 72). Stories
+    older than `max_age_hours` are left out anyway; a longer memory also
+    keeps a fresh story from coming back after a few hours, at the cost of
+    a longer prompt.
   - `max_age_hours` — stories whose articles were published longer ago are
     left out (default 12); articles that don't say when are kept.
   - `max_minutes` — upper limit on the whole segment's length (default 15).

@@ -75,7 +75,7 @@ DEFAULTS = {
     "topics": ["national news", "world news", "politics", "economy"],
     "story_minutes": 2,
     "max_minutes": 15,
-    "avoid_repeat_hours": 12,
+    "avoid_repeat_hours": 4,
     "max_age_hours": 12,
     "models": [],
     "avoid_models": [],
