@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Radio</title>
+  <meta name="description" content="Stacje radiowe prowadzone przez AI DJ-a: słuchaj na żywo, sprawdź, co gra i co grało.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%BB%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <span></span><span></span><span></span><span></span>
+      </span>
+      <h1 id="site-title">AI Radio</h1>
+    </div>
+    <p class="tagline">Stacje prowadzone przez AI DJ-a. Wybierz stację i słuchaj na żywo.</p>
+  </header>
+
+  <main>
+    <p id="status-message" class="status-message" role="status">Wczytywanie stacji…</p>
+    <section id="stations" class="stations" aria-live="polite"></section>
+  </main>
+
+  <footer class="site-footer">
+    <span id="updated-at"></span>
+  </footer>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <audio id="player" preload="none"></audio>
+
+  <template id="station-template">
+    <article class="station">
+      <div class="station-top">
+        <button class="play" type="button" aria-label="Słuchaj">
+          <svg class="icon-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+          <svg class="icon-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>
+          <span class="spinner" aria-hidden="true"></span>
+        </button>
+        <div class="station-heading">
+          <h2 class="station-name"></h2>
+          <div class="station-meta">
+            <span class="genre"></span>
+            <span class="listeners" title="Słuchacze"></span>
+          </div>
+        </div>
+      </div>
+      <p class="description"></p>
+
+      <div class="now">
+        <div class="now-label">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span class="now-state">Na antenie</span>
+          <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
+        </div>
+        <p class="now-title"></p>
+      </div>
+
+      <div class="history">
+        <h3>Ostatnio grane</h3>
+        <ol class="history-list"></ol>
+      </div>
+
+      <div class="extras"></div>
+
+      <div class="links">
+        <button class="copy" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></svg>
+          Kopiuj link do streamu
+        </button>
+        <a class="m3u" download>Plik .m3u</a>
+      </div>
+    </article>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>

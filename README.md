@@ -466,6 +466,32 @@ Adding another station later is just another `enable --now` pair with a
 different ID — no new unit files needed. Logs: see [Logs](#logs), or
 `journalctl -u radio-agent@ciezki_mlot -f`.
 
+## Web page
+
+`web_server.py` serves a simple page (in `web/`) for listeners: every
+station with a player, what's on air right now, the last 5 songs with the
+time they started (from the play history, so without DJ intros or news),
+its genre, description and schedule (news, programs), and buttons to copy
+the stream's link or download it as an `.m3u` playlist. It refreshes itself
+every 15 seconds.
+
+It uses only the standard library: static files plus one JSON endpoint,
+`/api/status`, built from `stations.json`, Icecast's status and
+`music_library.db`. Run it from the project directory:
+
+```bash
+./venv/bin/python web_server.py      # http://<host>:8080
+```
+
+or install `systemd/radio-web.service` like the other units and
+`sudo systemctl enable --now radio-web.service`. Settings (in `.env`):
+
+| Variable | Meaning |
+|---|---|
+| `WEB_PORT` / `WEB_HOST` | Where the page is served (default `0.0.0.0:8080`) |
+| `WEB_TITLE` | The page's title (default "AI Radio") |
+| `ICECAST_PUBLIC_URL` | The streams' base URL for listeners, e.g. `https://radio.example.com`; by default the page's own host name with `ICECAST_PORT` |
+
 ## Adding a new station
 
 1. Add an entry to `stations.json` (copy `ciezki_mlot`'s shape).
