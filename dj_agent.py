@@ -437,11 +437,14 @@ def _shorten(text, limit=500):
     return text if len(text) <= limit else text[:limit] + f"... ({len(text)} chars)"
 
 
-def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT, model=None):
+def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT, model=None, avoid=()):
     """Sends a prompt to OpenRouter and parses the response as JSON. The
     prompt must instruct the model to reply with raw JSON. `purpose` only
     labels the request in the logs. `model` asks for a specific model, with
-    OpenRouter falling back to OPENROUTER_MODEL if it's unavailable. Every failure is logged (under the "llm"
+    OpenRouter falling back to OPENROUTER_MODEL if it's unavailable. An
+    answer from a model whose name starts with one of `avoid` is rejected
+    (as unusable), e.g. small models openrouter/free picks that garble the
+    station's language. Every failure is logged (under the "llm"
     component) before being raised."""
     if not OPENROUTER_API_KEY:
         raise ValueError("OPENROUTER_API_KEY is missing. Check your .env file.")
@@ -505,6 +508,9 @@ def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT, model=None
         raise KeyError("OpenRouter did not return 'choices'.")
 
     model = result.get("model", "?")
+    if any(model.startswith(prefix) for prefix in avoid):
+        llm_log.warning(f"Rejected the answer ({purpose}) from {model}, a model to avoid for this")
+        raise ValueError(f"{model} is on the list of models to avoid.")
     usage = result.get("usage") or {}
     llm_log.info(
         f"Response ({purpose}) from {model} in {elapsed:.1f}s "
@@ -532,7 +538,7 @@ def call_openrouter_json(prompt, purpose, timeout=OPENROUTER_TIMEOUT, model=None
     return parsed
 
 
-def ask_llm_json(prompt, purpose, validate, timeout=OPENROUTER_TIMEOUT, models=()):
+def ask_llm_json(prompt, purpose, validate, timeout=OPENROUTER_TIMEOUT, models=(), avoid=()):
     """call_openrouter_json(), retried until `validate(parsed)` accepts the
     answer (it raises ValueError/KeyError on an unusable one) and returns
     what the caller needs from it. Raises the last error if every attempt
@@ -541,12 +547,13 @@ def ask_llm_json(prompt, purpose, validate, timeout=OPENROUTER_TIMEOUT, models=(
     `models` are preferred models, tried first, one attempt each, in order;
     then OPENROUTER_ATTEMPTS attempts go to OPENROUTER_MODEL. So preferred
     models that are down, slow or answering badly never eat into the usual
-    attempts."""
+    attempts. Answers from `avoid` models are rejected (see
+    call_openrouter_json)."""
     attempts = len(models) + OPENROUTER_ATTEMPTS
     for attempt in range(1, attempts + 1):
         model = models[attempt - 1] if attempt <= len(models) else None
         try:
-            return validate(call_openrouter_json(prompt, purpose, timeout, model))
+            return validate(call_openrouter_json(prompt, purpose, timeout, model, avoid))
         except (requests.RequestException, ValueError, KeyError) as e:
             if attempt == attempts:
                 raise
@@ -573,7 +580,8 @@ def pick_by_indices(indices, candidates, purpose):
     return picked
 
 
-def curate_artists_and_script(artists, prompt_template, station_name, description, song_count, models=()):
+def curate_artists_and_script(artists, prompt_template, station_name, description, song_count, models=(),
+                              avoid=()):
     """Asks the AI to pick `song_count` artists for the next block and write
     the DJ intro."""
     prompt = prompt_template.format(
@@ -596,7 +604,7 @@ def curate_artists_and_script(artists, prompt_template, station_name, descriptio
             llm_log.warning(f"Asked for {song_count} artist(s), AI picked {len(selected)} valid one(s)")
         return selected[:song_count], script.strip()
 
-    return ask_llm_json(prompt, "curation", validate, models=models)
+    return ask_llm_json(prompt, "curation", validate, models=models, avoid=avoid)
 
 
 def describe_artists(artists, config):
@@ -1021,7 +1029,7 @@ async def run_artist_program_block(station_id, config, program, slot_start, slot
         return script.strip()
 
     try:
-        dj_text = ask_llm_json(prompt, "program", validate, models=program['models'])
+        dj_text = ask_llm_json(prompt, "program", validate, models=program['models'], avoid=program['avoid_models'])
     except Exception as e:
         log.warning(f"Couldn't write the program's DJ script ({e}); using the fallback script.")
         dj_text = (program['fallback_script'] or config.get('fallback_script', "")).format(
@@ -1073,7 +1081,7 @@ async def run_station(station_id, starts_at=None):
             selected_tracks, dj_text = program_block
             return await finish_block(config, selected_tracks, dj_text, dj_audio_file)
     theme_episode = None
-    models = ()
+    models, avoid = (), ()
     if active and active[0]['mode'] == "theme":
         program, slot_start, slot_end = active
         theme_episodes = programs.Episodes(get_station_dir(station_id), program['id'])
@@ -1084,7 +1092,7 @@ async def run_station(station_id, starts_at=None):
             description=program['theme'] or config['description'],
             songs_per_block=program.get('songs_per_block') or config.get('songs_per_block'),
         )
-        models = program['models']
+        models, avoid = program['models'], program['avoid_models']
         log.info(f"Program '{program['title']}' block {theme_episode['blocks'] + 1} (theme)", extra=SUMMARY)
     song_count = config.get('songs_per_block', DEFAULT_SONGS_PER_BLOCK)
 
@@ -1160,7 +1168,7 @@ async def run_station(station_id, starts_at=None):
     # 3. Ask AI to pick best artists and write intro using prompt from config
     try:
         selected_artists, dj_text = curate_artists_and_script(
-            artists_pool, config['prompt'], config['name'], config['description'], song_count, models
+            artists_pool, config['prompt'], config['name'], config['description'], song_count, models, avoid
         )
     except Exception as e:
         log.warning(f"Error during AI curation: {e}. Falling back to random selection and the fallback script.")
@@ -1303,7 +1311,8 @@ def get_news_stories(settings, language, hour):
                 return json.load(f)
 
         def ask_json(prompt, purpose, validate, models=()):
-            return ask_llm_json(prompt, purpose, validate, OPENROUTER_BACKGROUND_TIMEOUT, models)
+            return ask_llm_json(
+                prompt, purpose, validate, OPENROUTER_BACKGROUND_TIMEOUT, models, settings["avoid_models"])
 
         # The last few hours' bulletins (same settings), so they aren't
         # repeated hour after hour.

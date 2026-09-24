@@ -20,6 +20,7 @@ DEFAULTS = {
     "repeat_after_episodes": 8,
     "fallback_script": "",
     "models": [],  # preferred models for the DJ's words, as for news
+    "avoid_models": [],  # models whose answers are rejected, as for news
 }
 # Episodes remembered per program (for repeat_after_episodes).
 MAX_EPISODES_KEPT = 100

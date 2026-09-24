@@ -57,6 +57,7 @@ DEFAULTS = {
     "max_minutes": 15,
     "avoid_repeat_hours": 3,
     "models": [],
+    "avoid_models": [],
     "title": "News",
     "intro": "It's {hour}:00 on {station_name}. Here's what's in the news: {topics}",
     "outro": "That's all the news for now. Back to the music.",

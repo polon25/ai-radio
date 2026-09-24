@@ -382,6 +382,10 @@ keyed by station ID:
     ones that garble it. Each is tried once, in order (moving on after an
     error, a timeout, or an unusable or too short answer), before the usual
     `OPENROUTER_ATTEMPTS` tries with `OPENROUTER_MODEL`.
+  - `avoid_models` — model name prefixes whose answers are rejected (and the
+    request retried), e.g. small models `openrouter/free` sometimes picks
+    that garble the station's language. Each rejection costs an extra
+    request, so keep the list to the worst offenders.
   - `title` — the segment's title in the stream (default `"News"`).
   - `intro` / `outro` — the segment's fixed opening and closing lines;
     `intro` can use `{hour}`, `{station_name}` and `{topics}` (the stories'
@@ -402,7 +406,8 @@ keyed by station ID:
   - `theme` — theme mode: what the program plays.
   - `artists`, `exclude_artists`, `min_minutes`, `repeat_after_episodes`
     (default 8) — artist mode: which artists may be picked (see above).
-  - `models` — preferred OpenRouter models for the DJ's words, as for news.
+  - `models`, `avoid_models` — preferred and rejected OpenRouter models for
+    the DJ's words, as for news.
   - `fallback_script` — said if the AI can't write the DJ's words; can use
     `{station_name}`, `{title}` and `{artist}`.
   The DJ speaks the language of the station's `voice`.
