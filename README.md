@@ -163,16 +163,21 @@ Twenty-five minutes before, the agent
    pages (links that look like articles) or RSS/Atom feeds,
 2. asks the AI to pick the most important distinct stories — normally at
    least one for each of the `topics`, unless there's good reason not to —
-   a few more than `count`, most important first, leaving out
-   stories covered in the last `avoid_repeat_hours` bulletins unless the
-   headlines show something new (a story that does come back is written as
-   an update, focusing on what's new). Articles already read out in those
-   bulletins (same link or headline) are removed from the list beforehand,
-   since weaker models don't always follow that instruction,
+   a few more than `count`, most important first, preferring today's news
+   and leaving out stories covered in the last `avoid_repeat_hours`
+   bulletins unless the headlines show something new (a story that does
+   come back is written as an update, focusing on what's new). Articles
+   already read out in those bulletins (same link or headline) are removed
+   from the list beforehand, since weaker models don't always follow that
+   instruction,
 3. fetches those articles' text (for sites that block it, e.g. the New York
-   Times, the feed's summary is used instead) and keeps the `count` most
-   important stories whose full article it got, as a summary alone can't
-   fill a couple of minutes without padding,
+   Times, the feed's summary is used instead) and publication time, drops
+   stories published more than `max_age_hours` ago (a front page can keep
+   a day-old story for long; if that leaves too few with a full article,
+   the AI picks more from the other headlines — feed items, whose time the feed gives, are
+   dropped before picking) and keeps the `count` most important stories
+   whose full article it got, as a summary alone can't fill a couple of
+   minutes without padding,
 4. asks the AI to rewrite each story as a spoken news item of about
    `story_minutes` — keeping strictly to the facts in the material, with no
    filler — plus a one-sentence summary of it for the segment's opening, and
@@ -429,7 +434,11 @@ keyed by station ID:
     "economy"]`.
   - `story_minutes` — roughly how long each story is read for (default 2).
   - `avoid_repeat_hours` — how many previous hours' bulletins a story isn't
-    repeated from, unless there's news in it (default 3).
+    repeated from, unless there's news in it (default 12, at most 72).
+    Older stories are left out by `max_age_hours` anyway, so there's little
+    point in making it longer than that, just a longer prompt.
+  - `max_age_hours` — stories whose articles were published longer ago are
+    left out (default 12); articles that don't say when are kept.
   - `max_minutes` — upper limit on the whole segment's length (default 15).
   - `models` — preferred OpenRouter models for the news, in order (default
     none, i.e. `OPENROUTER_MODEL`). Worth listing large models that write the

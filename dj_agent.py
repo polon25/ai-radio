@@ -109,6 +109,9 @@ NEWS_DIR_NAME = "news"
 # News stories shared by all stations with the same news settings, one file
 # per hour, so the AI writes them once (project root; gitignored).
 NEWS_CACHE_DIR = "news_cache"
+# How long those are kept: the news' avoid_repeat_hours can't reach back
+# further than this.
+NEWS_CACHE_DAYS = 3
 # A news segment is prepared this long before the top of the hour it's for,
 # queued this long before it (it then plays as soon as the current track
 # ends, i.e. around the top of the hour), and dropped if it's still not ready
@@ -1077,19 +1080,21 @@ def get_news_stories(settings, language, hour):
             return ask_llm_json(
                 prompt, purpose, validate, OPENROUTER_BACKGROUND_TIMEOUT, models, settings["avoid_models"])
 
-        # The last few hours' bulletins (same settings), so they aren't
-        # repeated hour after hour.
+        # The last few hours' bulletins (same sources), newest first, so
+        # their stories aren't repeated hour after hour.
         recent = []
         for hours_ago in range(1, settings['avoid_repeat_hours'] + 1):
             earlier = hour - datetime.timedelta(hours=hours_ago)
             for path in glob.glob(os.path.join(NEWS_CACHE_DIR, f"{earlier:%Y%m%d-%H}-{history}-*.json")):
-                recent.extend(read_json(path, []))
+                recent.extend(
+                    dict(story, aired=f"{earlier:%a %H:%M}", hours_ago=hours_ago) for story in read_json(path, [])
+                )
         stories = news.build_stories(settings, language, ask_json, recent)
         write_json(base + ".json", stories, indent=1)
-    # Drop other hours' stories (and locks) older than a day.
+    # Drop stories (and locks) too old to be avoided any more.
     for name in os.listdir(NEWS_CACHE_DIR):
         path = os.path.join(NEWS_CACHE_DIR, name)
-        if time.time() - os.path.getmtime(path) > 86400:
+        if time.time() - os.path.getmtime(path) > NEWS_CACHE_DAYS * 86400:
             os.remove(path)
     return stories
 
