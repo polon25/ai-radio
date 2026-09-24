@@ -909,6 +909,9 @@ def _escape_braces(text):
     return str(text).replace("{", "{{").replace("}", "}}")
 
 
+# An artist-mode episode avoids artists among the station's last this many
+# songs, so it doesn't open with an artist listeners just heard.
+RECENTLY_HEARD_SONGS = 6
 # Rough length of a DJ intro, for guessing whether a program block ends
 # after its slot does (and should close the episode) before it's written.
 DJ_INTRO_SECONDS_GUESS = 30
@@ -932,7 +935,8 @@ def choose_program_artist(station_id, program, slot_start, slot_end, tracks, epi
     min_minutes (default: the slot's length) of music the station may play,
     from the program's `artists` or else the station's roster, leaving out
     `exclude_artists` and, if possible, the artists of the last
-    repeat_after_episodes episodes. None if no artist has enough music."""
+    repeat_after_episodes episodes or among the last few songs played. None
+    if no artist has enough music."""
     minutes = {}
     for _, artist, _, duration in tracks:
         minutes[artist] = minutes.get(artist, 0) + (duration or 0) / 60
@@ -940,7 +944,10 @@ def choose_program_artist(station_id, program, slot_start, slot_end, tracks, epi
     pool = program["artists"] or load_artist_roster(station_id)["allowed"] or list(minutes)
     excluded = set(program["exclude_artists"])
     candidates = [a for a in pool if a not in excluded and minutes.get(a, 0) >= needed]
+    # Avoid the last episodes' artists and, so an episode doesn't open with
+    # an artist listeners just heard, the station's last couple of blocks'.
     recent = set(episodes.recent_artists(program["repeat_after_episodes"]))
+    recent |= set(load_recent_artists(station_id)[-RECENTLY_HEARD_SONGS:])
     fresh = [a for a in candidates if a not in recent]
     if not candidates:
         log.warning(f"Program '{program['id']}': no artist has {needed:.0f} min of music; playing as usual.")
