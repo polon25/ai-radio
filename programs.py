@@ -15,8 +15,13 @@ DEFAULTS = {
     "instructions": "",
     "theme": "",
     "artists": [],
+    "exclude": [],
     "exclude_artists": [],
-    "min_minutes": None,  # artist mode: defaults to the slot's length
+    "min_minutes": None,  # artist/collection mode: defaults to the slot's length
+    # collection mode: how tracks are grouped into collections
+    "group_by": "folder",  # "folder" or "album"
+    "folder_after": "",  # group_by folder: collections are this folder's subfolders
+    "subject_label": "",  # e.g. "the soundtrack of the game", for the DJ
     "repeat_after_episodes": 8,
     "fallback_script": "",
     "models": [],  # preferred models for the DJ's words, as for news
@@ -78,8 +83,8 @@ def current_program(config, when):
 
 
 class Episodes:
-    """A program's episodes on one station: which artist each was about
-    (artist mode) and how many blocks it has had, kept in
+    """A program's episodes on one station: which artist or collection each
+    was about and how many blocks it has had, kept in
     stations/<id>/programs/<program id>.json so a restarted agent carries on
     with the same episode."""
 
@@ -103,9 +108,11 @@ class Episodes:
         self.save()
         return episode
 
-    def recent_artists(self, count):
-        """Artists of the last `count` episodes."""
-        return [e["artist"] for e in self.episodes[-count:] if e.get("artist")] if count else []
+    def recent_subjects(self, count):
+        """Subjects (artists or collections) of the last `count` episodes."""
+        if not count:
+            return []
+        return [e.get("subject") or e.get("artist") for e in self.episodes[-count:] if e.get("subject") or e.get("artist")]
 
     def save(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)

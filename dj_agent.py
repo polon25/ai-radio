@@ -936,64 +936,97 @@ def program_position(episode, starts_at, block_seconds, slot_end):
     return "The episode is under way (don't welcome the listeners or announce the program again)."
 
 
-def choose_program_artist(station_id, program, slot_start, slot_end, tracks, episodes):
-    """Picks the artist of a new artist-mode episode: one with at least
-    min_minutes (default: the slot's length) of music the station may play,
-    from the program's `artists` or else the station's roster, leaving out
-    `exclude_artists` and, if possible, the artists of the last
-    repeat_after_episodes episodes or among the last few songs played. None
-    if no artist has enough music."""
+def program_subject_of(program):
+    """For an artist- or collection-mode program, a function giving the
+    subject a track (path, artist, title, duration) belongs to: its artist,
+    or its collection, i.e. its album or, with "group_by": "folder", the
+    folder right below the one named `folder_after` (e.g. each game's folder
+    under "Soundtracks"). None for tracks outside any collection."""
+    if program['mode'] == "artist":
+        return lambda track: track[1]
+    if program['group_by'] == "album":
+        conn = sqlite3.connect(DB_FILE)
+        albums = dict(conn.execute("SELECT filepath, album FROM tracks").fetchall())
+        conn.close()
+        return lambda track: (albums.get(track[0]) or None) if albums.get(track[0]) != "Unknown Album" else None
+    marker = f"/{program['folder_after'].strip('/')}/"
+
+    def folder(track):
+        _, found, rest = track[0].partition(marker)
+        return rest.split("/")[0] if found and "/" in rest else None
+    return folder
+
+
+def choose_program_subject(station_id, program, slot_start, slot_end, tracks, subject_of, episodes):
+    """Picks the subject (artist or collection) of a new episode: one with
+    at least min_minutes (default: the slot's length) of music the station
+    may play, from the program's `artists` or else (artist mode) the
+    station's roster, leaving out `exclude`/`exclude_artists` and, if
+    possible, the subjects of the last repeat_after_episodes episodes and
+    (artist mode) artists among the last few songs played. None if no
+    subject has enough music."""
     minutes = {}
-    for _, artist, _, duration in tracks:
-        minutes[artist] = minutes.get(artist, 0) + (duration or 0) / 60
+    for track in tracks:
+        subject = subject_of(track)
+        if subject:
+            minutes[subject] = minutes.get(subject, 0) + (track[3] or 0) / 60
     needed = program["min_minutes"] or (slot_end - slot_start).total_seconds() / 60
-    pool = program["artists"] or load_artist_roster(station_id)["allowed"] or list(minutes)
-    excluded = set(program["exclude_artists"])
-    candidates = [a for a in pool if a not in excluded and minutes.get(a, 0) >= needed]
-    # Avoid the last episodes' artists and, so an episode doesn't open with
+    if program["artists"]:
+        pool = program["artists"]
+    elif program["mode"] == "artist":
+        pool = load_artist_roster(station_id)["allowed"] or list(minutes)
+    else:
+        pool = list(minutes)
+    excluded = set(program["exclude"]) | set(program["exclude_artists"])
+    candidates = [s for s in pool if s not in excluded and minutes.get(s, 0) >= needed]
+    # Avoid the last episodes' subjects and, so an episode doesn't open with
     # an artist listeners just heard, the station's last couple of blocks'.
-    recent = set(episodes.recent_artists(program["repeat_after_episodes"]))
-    recent |= set(load_recent_artists(station_id)[-RECENTLY_HEARD_SONGS:])
-    fresh = [a for a in candidates if a not in recent]
+    recent = set(episodes.recent_subjects(program["repeat_after_episodes"]))
+    if program["mode"] == "artist":
+        recent |= set(load_recent_artists(station_id)[-RECENTLY_HEARD_SONGS:])
+    fresh = [s for s in candidates if s not in recent]
     if not candidates:
-        log.warning(f"Program '{program['id']}': no artist has {needed:.0f} min of music; playing as usual.")
+        log.warning(f"Program '{program['id']}': nothing has {needed:.0f} min of music; playing as usual.")
         return None
-    artist = random.choice(fresh or candidates)
+    subject = random.choice(fresh or candidates)
     log.info(
-        f"Program '{program['title']}': today's artist is {artist} ({minutes[artist]:.0f} min of music; "
-        f"picked from {len(fresh or candidates)} artist(s) with enough).",
+        f"Program '{program['title']}': today's subject is {subject} ({minutes[subject]:.0f} min of music; "
+        f"picked from {len(fresh or candidates)} with enough).",
         extra=SUMMARY,
     )
-    return artist
+    return subject
 
 
-async def run_artist_program_block(station_id, config, program, slot_start, slot_end, starts_at, dj_audio_file):
-    """A block of an artist-mode program: songs by the episode's artist
-    (none repeated within the episode, least recently played first where
-    possible) and a DJ bit about the artist, their albums or the songs.
-    Returns (tracks, DJ text), or None if the program can't run."""
+async def run_subject_program_block(station_id, config, program, slot_start, slot_end, starts_at, dj_audio_file):
+    """A block of an artist- or collection-mode program: songs of the
+    episode's subject (an artist, or e.g. a game's soundtrack), none
+    repeated within the episode, least recently played first where possible,
+    and a DJ bit about the subject or the songs. Returns (tracks, DJ text),
+    or None if the program can't run."""
     song_count = program.get('songs_per_block') or config.get('songs_per_block', DEFAULT_SONGS_PER_BLOCK)
     episodes = programs.Episodes(get_station_dir(station_id), program['id'])
     tracks = get_station_tracks(config)
+    subject_of = program_subject_of(program)
     episode = episodes.get(slot_start)
     if episode is None:
-        artist = choose_program_artist(station_id, program, slot_start, slot_end, tracks, episodes)
-        if not artist:
+        subject = choose_program_subject(station_id, program, slot_start, slot_end, tracks, subject_of, episodes)
+        if not subject:
             return None
-        episode = episodes.start(slot_start, artist=artist, said=[], tracks=[])
-    artist = episode['artist']
+        fields = {"artist": subject} if program['mode'] == "artist" else {"subject": subject}
+        episode = episodes.start(slot_start, said=[], tracks=[], **fields)
+    subject = episode.get('subject') or episode['artist']
 
     # Songs: not yet picked in this episode (the episode keeps its own list:
     # a song queued a moment ago isn't in the play history yet), preferring
     # ones that haven't played for a while; if the episode runs out, repeats
     # are allowed.
     last_plays = get_last_plays(station_id)
-    artist_tracks = [t for t in tracks if t[1] == artist]
+    subject_tracks = [t for t in tracks if subject_of(t) == subject]
     picked_before = set(episode.get('tracks', []))
     unplayed = [
-        t for t in artist_tracks
+        t for t in subject_tracks
         if t[0] not in picked_before and last_plays.get(t[0], 0) < slot_start.timestamp()
-    ] or artist_tracks
+    ] or subject_tracks
     cutoff = time.time() - track_cooldown_seconds(config, tracks)
     fresh = [t for t in unplayed if last_plays.get(t[0], 0) < cutoff]
     stale = [t for t in unplayed if t not in fresh]
@@ -1001,36 +1034,42 @@ async def run_artist_program_block(station_id, config, program, slot_start, slot
     stale.sort(key=lambda t: last_plays.get(t[0], 0))
     selected = (fresh + stale)[:song_count]
     if not selected:
-        log.error(f"Program '{program['id']}': no track by {artist} to play.")
+        log.error(f"Program '{program['id']}': no track of {subject} to play.")
         return None
 
+    is_artist = program['mode'] == "artist"
     conn = sqlite3.connect(DB_FILE)
     details = []
-    for path, _, title, _ in selected:
+    for path, artist, title, _ in selected:
         album, year = conn.execute("SELECT album, year FROM tracks WHERE filepath = ?", (path,)).fetchone()
-        details.append(f'"{title}"' + (f", album: {album}" if album and album != "Unknown Album" else "")
+        details.append(f'"{title}"' + ("" if is_artist else f" by {artist}")
+                       + (f", album: {album}" if album and album != "Unknown Album" else "")
                        + (f", {year}" if year else ""))
     conn.close()
+    if is_artist:
+        about = subject
+    else:
+        about = f"{program['subject_label'] or 'the collection'} \"{subject}\" (as named in the music library; " \
+                "refer to it by its proper name)"
     position = program_position(episode, starts_at, sum(t[3] or 0 for t in selected), slot_end)
     said = "\n".join(f"- {text}" for text in episode.get('said', [])[-6:])
-    titles = {t[0]: t[2] for t in artist_tracks}
+    titles = {t[0]: t[2] for t in subject_tracks}
     played = ", ".join(f'"{titles[path]}"' for path in episode.get('tracks', []) if path in titles)
     prompt = (
         f"You are the DJ of the radio station \"{config['name']}\" ({config['description']}), presenting its "
-        f"recurring program \"{program['title']}\". Today's episode is all about {artist}.\n"
+        f"recurring program \"{program['title']}\". Today's episode is all about {about}.\n"
         + (f"Program instructions: {program['instructions']}\n" if program['instructions'] else "")
         + f"{position}\n"
         + (f"Already played earlier in this episode: {played}.\n" if played else "")
         + (f"What you already said earlier in this episode:\n{said}\nDon't repeat any of those facts, "
            f"albums or songs: pick a new angle this time (another album, a collaboration, a story behind "
-           f"one of the next songs, the artist's influences or influence...).\n" if said else "")
+           f"one of the next songs, influences, the people behind it...).\n" if said else "")
         + "The next songs, in order:\n" + "\n".join(f"{i}. {d}" for i, d in enumerate(details, 1)) + "\n\n"
         f"Write what you say before these songs, in the language of locale {station_language(config)} "
-        f"(e.g. Polish for pl-PL), about 60-130 words: share something interesting about {artist}, their "
-        f"albums or these songs, then introduce the songs. Only state facts you're confident are true; if "
-        f"you don't know much about the artist, talk about the songs and albums listed instead of making "
-        f"anything up. Always refer to the station by its exact name. Plain spoken sentences, no emojis, "
-        f"asterisks or hashtags."
+        f"(e.g. Polish for pl-PL), about 60-130 words: share something interesting about today's subject or "
+        f"these songs, then introduce the songs. Only state facts you're confident are true; if you don't "
+        f"know much about it, talk about the songs and albums listed instead of making anything up. Always "
+        f"refer to the station by its exact name. Plain spoken sentences, no emojis, asterisks or hashtags."
         + "\n\nYou MUST respond strictly in valid JSON format with no markdown formatting around it, "
         'structured like this:\n{"dj_script": "..."}'
     )
@@ -1046,13 +1085,13 @@ async def run_artist_program_block(station_id, config, program, slot_start, slot
     except Exception as e:
         log.warning(f"Couldn't write the program's DJ script ({e}); using the fallback script.")
         dj_text = (program['fallback_script'] or config.get('fallback_script', "")).format(
-            station_name=config['name'], title=program['title'], artist=artist)
+            station_name=config['name'], title=program['title'], artist=subject, subject=subject)
     episode['blocks'] += 1
     episode['said'] = (episode.get('said', []) + [dj_text])[-12:]
     episode['tracks'] = episode.get('tracks', []) + [t[0] for t in selected]
     episodes.save()
-    save_recent_artists(station_id, load_recent_artists(station_id) + [artist] * len(selected))
-    log.info(f"Program '{program['title']}' block {episode['blocks']} ({artist})", extra=SUMMARY)
+    save_recent_artists(station_id, load_recent_artists(station_id) + [t[1] for t in selected])
+    log.info(f"Program '{program['title']}' block {episode['blocks']} ({subject})", extra=SUMMARY)
     return [t[:3] for t in selected], dj_text
 
 
@@ -1088,8 +1127,8 @@ async def run_station(station_id, starts_at=None):
     dj_audio_file = new_intro_audio_file(station_id)
     starts_at = starts_at or datetime.datetime.now()
     active = programs.current_program(config, starts_at)
-    if active and active[0]['mode'] == "artist":
-        program_block = await run_artist_program_block(station_id, config, *active, starts_at, dj_audio_file)
+    if active and active[0]['mode'] in ("artist", "collection"):
+        program_block = await run_subject_program_block(station_id, config, *active, starts_at, dj_audio_file)
         if program_block:
             selected_tracks, dj_text = program_block
             return await finish_block(config, selected_tracks, dj_text, dj_audio_file)

@@ -195,7 +195,7 @@ opens and ends with the last one starting before it closes. Programs don't
 change the news: it still plays around the top of the hour, between blocks
 (so a program at 12:00 effectively starts after the 12:00 news).
 
-Two kinds (`mode`):
+Three kinds (`mode`):
 
 - `artist` — each episode is about one artist, picked when it starts: at
   random from the program's `artists` (or else the station's roster), among
@@ -208,6 +208,14 @@ Two kinds (`mode`):
   artist, their albums or the songs before each later block — given the
   songs' albums and years from the library, and what was already said in
   the episode, so as not to repeat it — and closes the last block.
+- `collection` — like `artist`, but each episode is about one collection of
+  tracks instead: an album, or (`"group_by": "folder"`) one of the folders
+  right below the folder named `folder_after` — e.g. with game soundtracks
+  kept as `Soundtracks/<game>/...`, each episode plays one game's
+  soundtrack, and the DJ talks about the game, its composers and music.
+  `subject_label` tells the DJ what a collection is (e.g. "the soundtrack of
+  the game"); it's told the collection's name as it appears in the library
+  (folder or album name) and to use its proper name.
 - `theme` — each block is picked by the AI from the station's roster to fit
   the program's `theme` (e.g. "power ballads of the 80s"), with the program's
   instructions for the DJ; the station's cooldowns still apply.
@@ -398,18 +406,22 @@ keyed by station ID:
   - `schedule` — its slots, e.g. `[{"days": ["mon"], "start": "12:00",
     "end": "13:00"}]`; `days` are `mon`...`sun` or `"daily"` (the default);
     a slot ending before it starts runs past midnight.
-  - `mode` — `"artist"` (default) or `"theme"`.
+  - `mode` — `"artist"` (default), `"collection"` or `"theme"`.
   - `instructions` — free-text instructions for the DJ (tone, what to talk
     about), in any language.
   - `songs_per_block` — songs between the DJ's words (default: the
     station's).
   - `theme` — theme mode: what the program plays.
-  - `artists`, `exclude_artists`, `min_minutes`, `repeat_after_episodes`
-    (default 8) — artist mode: which artists may be picked (see above).
+  - `artists`, `exclude` (or `exclude_artists`), `min_minutes`,
+    `repeat_after_episodes` (default 8) — artist and collection modes: which
+    artists or collections may be picked (see above).
+  - `group_by` (`"folder"`, the default, or `"album"`), `folder_after`,
+    `subject_label` — collection mode (see above).
   - `models`, `avoid_models` — preferred and rejected OpenRouter models for
     the DJ's words, as for news.
   - `fallback_script` — said if the AI can't write the DJ's words; can use
-    `{station_name}`, `{title}` and `{artist}`.
+    `{station_name}`, `{title}` and `{artist}` or `{subject}` (the episode's
+    artist or collection).
   The DJ speaks the language of the station's `voice`.
 - `roster_prompt` and `prompt` must each produce raw JSON with a
   `selected_indices` field (`prompt` additionally needs `dj_script`); see the
