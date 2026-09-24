@@ -5,7 +5,10 @@ An internet radio station that curates its own playlists. An LLM (via
 library that fit a station's theme, writes a short DJ intro script for them,
 and [Edge TTS](https://github.com/rany2/edge-tts) turns that script into
 audio. [Liquidsoap](https://www.liquidsoap.info) streams the result to an
-Icecast server.
+Icecast server. Stations can also air hourly news bulletins written from
+news sites, and recurring programs (e.g. an hour a day devoted to one
+artist, or to one game's soundtrack), and a small web page lets listeners
+tune in and see what's playing.
 
 The system supports multiple independent stations from one codebase — each
 station is just an entry in `stations.json` plus a running pair of processes.
@@ -16,8 +19,13 @@ station is just an entry in `stations.json` plus a running pair of processes.
 scanner.py          → indexes a music folder into music_library.db
 dj_agent.py --loop   → repeatedly: picks artists (via AI), fetches one track
                         per artist, writes a DJ intro (AI text → Edge TTS
-                        audio), and queues the block in Liquidsoap
-radio.liq             → plays the queued blocks and streams them to Icecast
+                        audio), and queues the block in Liquidsoap; during a
+                        program's slot, follows the program's rules instead;
+                        before every hour, prepares the news bulletin
+radio.liq             → plays the queued blocks (and news) and streams them
+                        to Icecast
+web_server.py         → the listeners' web page: players, what's on, what
+                        played (one for all stations)
 ```
 
 `dj_agent.py --loop` and `radio.liq` run as two independent, long-lived
@@ -295,7 +303,7 @@ lengths, years, genres), so rescans stay cheap.
    | `MUSIC_FOLDER` | Root folder `scanner.py` indexes |
    | `ICECAST_PASSWORD` | Must match `<source-password>` in `icecast.xml` |
    | `STATION_ID` | Which entry from `stations.json` this instance runs |
-   | `ICECAST_HOST` / `ICECAST_PORT` | Icecast server connection |
+   | `ICECAST_HOST` / `ICECAST_PORT` | Icecast server connection; `ICECAST_PORT` must match the `<port>` of `<listen-socket>` in `icecast.xml` |
    | `ICECAST_MOUNT` | Optional; defaults to `/<STATION_ID>` |
    | `OPENROUTER_SITE_URL` | Optional; sent as `HTTP-Referer` to OpenRouter |
    | `OPENROUTER_TIMEOUT` | Optional; seconds a whole OpenRouter request for a block (artist picks + DJ script) may take before it's given up on (default 60) |
@@ -325,6 +333,22 @@ lengths, years, genres), so rescans stay cheap.
    scanning](#library-scanning)), so this manual run is mainly for seeding
    the database before the first `--loop` start, or for `dj_agent.py`'s
    one-shot mode.
+
+5. **Icecast** — besides the passwords (the source password goes in `.env`
+   as `ICECAST_PASSWORD`), set the mounts' character set to UTF-8, inside
+   `<icecast>` in `icecast.xml`:
+
+   ```xml
+   <mount type="default">
+       <charset>UTF-8</charset>
+   </mount>
+   ```
+
+   Otherwise Icecast reads the stream names, descriptions and titles as
+   ISO-8859-1, which garbles anything outside it (e.g. Polish letters:
+   "CiÄÅ¼ki" for "Ciężki", "&#322;" for "ł"). The `<mount>` examples in
+   Icecast's default `icecast.xml` are commented out, so add this as a new
+   block rather than inside one of them. Restart Icecast afterwards.
 
 ## Configuring a station
 
@@ -465,6 +489,14 @@ sudo systemctl enable --now radio-agent@ciezki_mlot.service
 Adding another station later is just another `enable --now` pair with a
 different ID — no new unit files needed. Logs: see [Logs](#logs), or
 `journalctl -u radio-agent@ciezki_mlot -f`.
+
+The [web page](#web-page) has one unit for all stations:
+
+```bash
+sudo cp systemd/radio-web.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now radio-web.service
+```
 
 ## Web page
 
