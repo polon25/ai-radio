@@ -28,7 +28,9 @@ const template = document.getElementById("station-template");
 const player = document.getElementById("player");
 const cards = new Map();
 let playingId = null;
-let streamBase = null;
+// From /api/status: the streams' public base URL (null: this host), and
+// Icecast's port to use with this host.
+const streamConfig = { base: null, icecastPort: 8000 };
 
 function hueFor(id) {
   let hash = 0;
@@ -37,7 +39,7 @@ function hueFor(id) {
 }
 
 function streamUrl(station) {
-  const base = streamBase || `${location.protocol}//${location.hostname}:${state.icecastPort}`;
+  const base = streamConfig.base || `${location.protocol}//${location.hostname}:${streamConfig.icecastPort}`;
   return base + station.mount;
 }
 
@@ -192,15 +194,13 @@ function render(station) {
   renderExtras(card, station);
 }
 
-const state = { icecastPort: 8000 };
-
 async function refresh() {
   try {
     const response = await fetch("api/status", { cache: "no-store" });
     if (!response.ok) throw new Error(response.statusText);
     const data = await response.json();
-    streamBase = data.stream_base;
-    state.icecastPort = data.icecast_port;
+    streamConfig.base = data.stream_base;
+    streamConfig.icecastPort = data.icecast_port;
     document.title = data.title;
     document.getElementById("site-title").textContent = data.title;
     data.stations.forEach(render);
